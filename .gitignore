@@ -1,0 +1,33 @@
+# ESP-IDF build output
+/build/
+/sdkconfig.old
+
+# ESP-IDF managed dependencies (reproducible via dependencies.lock)
+/managed_components/
+
+# Local Python virtual envs / tool envs
+/.venv/
+/venv/
+/env/
+
+# VS Code local workspace state
+/.vscode/
+
+# Project documentation drafts
+/docs/
+
+# CMake/compile db noise (if generated at repo root)
+/CMakeFiles/
+/CMakeCache.txt
+/compile_commands.json
+/cmake_install.cmake
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.bak
+
+# OS files
+.DS_Store
+Thumbs.db
