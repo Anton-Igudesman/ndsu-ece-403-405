@@ -302,6 +302,32 @@ static void audio_log_dsp_debug(const float *bands_norm)
    if (status != ESP_OK) app_log_error(LOG_TAG, "self_test_log_eq_columns_text", status);
 }
 
+// Extract targeted stats for BLE advertisement
+static void audio_update_ble_snapshot(const float *bands_norm)
+{
+   if (bands_norm == NULL) return;
+
+   float peak_hz = 0.0f;
+   size_t peak_bin = 0;
+   float peak_mag = 0.0f;
+
+   esp_err_t status = audio_dsp_get_peak_frequency(&peak_hz, &peak_bin, &peak_mag);
+   if (status != ESP_OK)
+   {
+      app_log_error(LOG_TAG, "audio_dsp_get_peak_frequency", status);
+      return;
+   }
+
+   status = ble_telemetry_update_snapshot(
+      (uint8_t)peak_bin,
+      peak_hz,
+      bands_norm,
+      SPECTRUM_NUM_BANDS
+   );
+
+   if (status != ESP_OK) app_log_error(LOG_TAG, "ble_telemetry_update_snapshot", status);
+}
+
 // Live mic -> audio buffer -> FFT -> bands
 static void audio_fft_live_task(void *arg)
 {
@@ -347,6 +373,7 @@ static void audio_fft_live_task(void *arg)
       s_no_frame_count = 0;
       s_fft_frame_counter++;
       audio_publish_bands_to_led_queue(bands_norm);
+      audio_update_ble_snapshot(bands_norm); // Data for BLE advertisement packet
 
       // Throttle DSP/log path: keep 1 in 8 processed frames for display/log
       if ((s_fft_frame_counter % 8U) != 0U)
