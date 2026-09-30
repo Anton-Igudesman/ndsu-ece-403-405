@@ -1,5 +1,12 @@
 #include "spectrum_map.h"
 #include <math.h>
+#include "esp_log.h"
+
+#define SPECTRUM_MAP_TRACE_LOGS 1
+#define SPECTRUM_MAP_TRACE_DIVISOR 32U
+
+static const char *LOG_TAG = "spectrum_map";
+static uint32_t s_spectrum_map_trace_counter = 0;
 
 esp_err_t spectrum_map_bins_to_bands(
     const float *bins,
@@ -22,6 +29,11 @@ esp_err_t spectrum_map_bins_to_bands(
    // uniform bands in log-space
    const float log_min = logf(min_bin_index_f);
    const float log_max = logf(max_bin_index_f);
+   bool trace_this_call = false;
+#if SPECTRUM_MAP_TRACE_LOGS
+   s_spectrum_map_trace_counter++;
+   trace_this_call = ((s_spectrum_map_trace_counter % SPECTRUM_MAP_TRACE_DIVISOR) == 0U);
+#endif
    
    for (size_t band = 0; band < num_bands; band++) 
    {
@@ -42,12 +54,30 @@ esp_err_t spectrum_map_bins_to_bands(
 
       float sum = 0.0f;
       for (size_t i = start; i < end; i++) sum += bins[i];
+      size_t width = end - start;
+      float mean = sum / (float)width;
 
       /* 
          Band mean:
          bands[band] = (1/M) * sum_{i=start}^{end-1}(bins[i])
       */
-      bands[band] = sum / (float)(end - start);
+      bands[band] = mean;
+
+      if (trace_this_call)
+      {
+         ESP_LOGI(
+            LOG_TAG,
+            "Band-mapping step (band %u): normalized edges t0=%.3f and t1=%.3f map to bin range [%u, %u); width=%u bins; sum of magnitudes=%.2f; band mean (sum/width)=%.2f",
+            (unsigned)band,
+            t0,
+            t1,
+            (unsigned)start,
+            (unsigned)end,
+            (unsigned)width,
+            sum,
+            mean
+         );
+      }
    }
 
    return ESP_OK;

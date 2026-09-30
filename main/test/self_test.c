@@ -11,7 +11,7 @@
 #include "freertos/task.h"
 
 #include "dsp/audio_buffer.h"
-#include "dsp/fft_engine.h"
+#include "dsp/dft_engine.h"
 #include "dsp/spectrum_map.h"
 #include "common/math_constants.h"
 
@@ -100,28 +100,28 @@ static esp_err_t audio_buffer_self_test(void)
       frame[AUDIO_FRAME_SIZE - 1]);
    
    /*
-      1) Init FFT engine
+      1) Init DFT engine
       2) Process a frame
       3) Get magnitudes from bins
    */
-   status = fft_engine_init();
-   app_log_error(LOG_TAG, "fft_engine_init", status); // Status of fft_ingine_init
+   status = dft_engine_init();
+   app_log_error(LOG_TAG, "dft_engine_init", status); // Status of dft_ingine_init
    if (status != ESP_OK) return status;
 
-   status = fft_engine_process_frame(frame); // process frame
-   app_log_error(LOG_TAG, "fft_engine_process_frame", status);
+   status = dft_engine_process_frame(frame); // process frame
+   app_log_error(LOG_TAG, "dft_engine_process_frame", status);
    if (status != ESP_OK) return status;
 
    size_t bins = 0;
    const float *mags = NULL;
-   status = fft_engine_get_magnitudes(&mags, &bins);
-   app_log_error(LOG_TAG, "fft_engine_get_magnitudes", status);
+   status = dft_engine_get_magnitudes(&mags, &bins);
+   app_log_error(LOG_TAG, "dft_engine_get_magnitudes", status);
    if (status != ESP_OK || mags == NULL || bins == 0) return ESP_ERR_INVALID_STATE;
    
    float mag0 = mags[0];
    float mag1 = (bins > 1) ? mags[1] : 0.0f;
 
-   ESP_LOGI(LOG_TAG, "fft placeholder OK: bins=%u mag0=%.1f mag1=%.1f",
+   ESP_LOGI(LOG_TAG, "dft placeholder OK: bins=%u mag0=%.1f mag1=%.1f",
       (unsigned)bins,
       mag0,
       mag1);
