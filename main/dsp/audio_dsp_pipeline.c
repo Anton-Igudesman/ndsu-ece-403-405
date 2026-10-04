@@ -4,7 +4,6 @@
 
 #include "esp_log.h"
 #include "audio_buffer.h"
-#include "dft_engine.h"
 #include "fft_engine.h"
 #include "audio_dsp_pipeline.h"
 
@@ -12,7 +11,7 @@
 
 // Reduce persistent low-band domincance that can flatten EQ shape
 // Possibly at the loss of bass detail below 10 * 46.875 Hz
-#define DFT_SKIP_LOW_BINS 10
+#define FFT_SKIP_LOW_BINS 10
 #define DSP_PIPELINE_TRACE_LOGS 1
 #define DSP_PIPELINE_TRACE_DIVISOR 32U
 
@@ -60,13 +59,13 @@ esp_err_t audio_dsp_get_peak_frequency(
    const float *mags = NULL;
    size_t bins = 0;
 
-   esp_err_t status = dft_engine_get_magnitudes(&mags, &bins);
-   if (status != ESP_OK) return status; // Propagate DFT state/read error
+   esp_err_t status = fft_engine_get_magnitudes(&mags, &bins);
+   if (status != ESP_OK) return status; // Propagate FFT state/read error
    
    if (mags == NULL || bins == 0) return ESP_ERR_INVALID_STATE; // No usable spectrum data
    
 
-   size_t start_bin = DFT_SKIP_LOW_BINS;
+   size_t start_bin = FFT_SKIP_LOW_BINS;
    if (start_bin >= bins) start_bin = 0; // Fallback when skip exceeds available bins
    
    size_t peak_bin = start_bin;
@@ -81,7 +80,7 @@ esp_err_t audio_dsp_get_peak_frequency(
       }
    }
 
-   const float hz_per_bin = AUDIO_SAMPLE_RATE_HZ / (float)DFT_FRAME_SIZE; // Hz spacing between bins
+   const float hz_per_bin = AUDIO_SAMPLE_RATE_HZ / (float)FFT_FRAME_SIZE; // Hz spacing between bins
    const float peak_hz = (float)peak_bin * hz_per_bin; // Peak bin index -> Hz
 
    *peak_hz_out = peak_hz;
@@ -104,13 +103,13 @@ esp_err_t audio_dsp_get_band_peak_frequency(
    const float *mags = NULL;
    size_t bins = 0;
 
-   esp_err_t status = dft_engine_get_magnitudes(&mags, &bins);
+   esp_err_t status = fft_engine_get_magnitudes(&mags, &bins);
    if (status != ESP_OK) return status;
    
    // No usable spectrum data
    if (mags == NULL || bins == 0) return ESP_ERR_INVALID_STATE;
    
-   size_t start_offset = DFT_SKIP_LOW_BINS;
+   size_t start_offset = FFT_SKIP_LOW_BINS;
 
    // Fallback when skip exceeds available bins 
    if (start_offset >= bins) start_offset = 0;
@@ -152,7 +151,7 @@ esp_err_t audio_dsp_get_band_peak_frequency(
          }
       }
       size_t global_bin = local_peak_idx + start_offset;
-      const float hz_per_bin = AUDIO_SAMPLE_RATE_HZ / (float)DFT_FRAME_SIZE;
+      const float hz_per_bin = AUDIO_SAMPLE_RATE_HZ / (float)FFT_FRAME_SIZE;
 
       band_peak_hz_out[band] = (float)global_bin * hz_per_bin;
       band_peak_mag_out[band] = local_peak_mag;
@@ -166,7 +165,7 @@ esp_err_t audio_dsp_get_band_peak_frequency(
    return ESP_OK;
 }
 
-static esp_err_t compute_dft_magnitudes_from_frame(
+static esp_err_t compute_transform_magnitudes_from_frame(
    const int16_t *frame,
    const float **mags_out,
    size_t *bins_out)
@@ -174,27 +173,27 @@ static esp_err_t compute_dft_magnitudes_from_frame(
    // Validate input/output pointers before DSP state
    if (frame == NULL || mags_out == NULL || bins_out == NULL) return ESP_ERR_INVALID_ARG;
 
-   // dft_engine stores computed magnitudes in internal module buffer
-   esp_err_t status = dft_engine_process_frame(frame);
+   // FFT engine stores computed magnitudes in internal module buffer
+   esp_err_t status = fft_engine_process_frame(frame);
    if (status != ESP_OK) return status; 
 
-   // Read back pointer and bin count from dft_engine internal state
+   // Read back pointer and bin count from FFT engine internal state
    const float *mags = NULL;
    size_t bins = 0;
-   status = dft_engine_get_magnitudes(&mags, &bins);
+   status = fft_engine_get_magnitudes(&mags, &bins);
    if (status != ESP_OK) return status;
 
-   // Unexpected empty DFT output
+   // Unexpected empty FFT output
    if (mags == NULL || bins == 0) return ESP_ERR_INVALID_STATE;
 
-   // Return DFT outputs to caller 
+   // Return transform outputs to caller 
    *mags_out = mags;
    *bins_out = bins;
    return ESP_OK;
 }
 
-// Map DFT magnitudes into fixed number of spectrum bands
-static esp_err_t map_dft_bins_to_bands(
+// Map FFT magnitudes into fixed number of spectrum bands
+static esp_err_t map_fft_bins_to_bands(
    const float *mags,
    size_t bins,
    float *bands_out)
@@ -204,13 +203,13 @@ static esp_err_t map_dft_bins_to_bands(
 
    // Skip DC and near-DC bins to reduce low-freq bias
    size_t mapped_bins = 0;
-   if (bins > DFT_SKIP_LOW_BINS) mapped_bins = bins - DFT_SKIP_LOW_BINS;
+   if (bins > FFT_SKIP_LOW_BINS) mapped_bins = bins - FFT_SKIP_LOW_BINS;
 
    if (mapped_bins == 0) return ESP_ERR_INVALID_STATE;
 
-   // Map selected DFT region into SPECTRUM_NUM_BANDS averaged bands
+   // Map selected FFT region into SPECTRUM_NUM_BANDS averaged bands
    return spectrum_map_bins_to_bands(
-      mags + DFT_SKIP_LOW_BINS,
+      mags + FFT_SKIP_LOW_BINS,
       mapped_bins,
       bands_out,
       SPECTRUM_NUM_BANDS
@@ -360,10 +359,10 @@ static void trace_pipeline_math_once(
 
    ESP_LOGI(
       LOG_TAG,
-      "DSP conditioning step: DFT bins=%u, skipped low bins=%u, mapped bins=%u, strongest raw band=%.2f, soft-gate gain=%.3f, conditioned frame max=%.2f, running normalization max=%.2f",
+      "DSP conditioning step: FFT bins=%u, skipped low bins=%u, mapped bins=%u, strongest raw band=%.2f, soft-gate gain=%.3f, conditioned frame max=%.2f, running normalization max=%.2f",
       (unsigned)bins,
-      (unsigned)DFT_SKIP_LOW_BINS,
-      (unsigned)((bins > DFT_SKIP_LOW_BINS) ? (bins - DFT_SKIP_LOW_BINS) : 0U),
+      (unsigned)FFT_SKIP_LOW_BINS,
+      (unsigned)((bins > FFT_SKIP_LOW_BINS) ? (bins - FFT_SKIP_LOW_BINS) : 0U),
       max_raw,
       gate_gain,
       frame_max,
@@ -392,7 +391,7 @@ static void trace_pipeline_math_once(
    );
 }
 
-// run DFT -> map -> condition -> smooth -> normalize
+// run FFT -> map -> condition -> smooth -> normalize
 static esp_err_t map_condition_normalize_bands(
    const float *mags,
    size_t bins,
@@ -408,7 +407,7 @@ static esp_err_t map_condition_normalize_bands(
    float running_max = 0.0f;
    float frame_max = 0.0f;
 
-   esp_err_t status = map_dft_bins_to_bands(mags, bins, bands);
+   esp_err_t status = map_fft_bins_to_bands(mags, bins, bands);
    if (status != ESP_OK) return status;
 
    for (size_t band_index = 0; band_index < SPECTRUM_NUM_BANDS; band_index++)
@@ -449,7 +448,7 @@ static esp_err_t map_condition_normalize_bands(
 }
 
 /*
-   If a full frame is ready, run DFT -> map -> condition -> smooth -> normalize
+   If a full frame is ready, run FFT -> map -> condition -> smooth -> normalize
    Returns ESP_OK when no error (whether or not frame was ready)
 */
 esp_err_t audio_dsp_process_ready_frame(float *bands_norm_out, bool *frame_processed)
@@ -466,7 +465,7 @@ esp_err_t audio_dsp_process_ready_frame(float *bands_norm_out, bool *frame_proce
 
    const float *mags = NULL;
    size_t bins = 0;
-   status = compute_dft_magnitudes_from_frame(frame, &mags, &bins);
+   status = compute_transform_magnitudes_from_frame(frame, &mags, &bins);
    if (status != ESP_OK) return status;
 
    status = map_condition_normalize_bands(mags, bins, bands_norm_out);

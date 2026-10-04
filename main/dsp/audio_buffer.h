@@ -1,7 +1,7 @@
 #ifndef AUDIO_BUFFER_H
 #define AUDIO_BUFFER_H 
 
-// Hz per bin = sample_rate/hz / DFT size => 43.875 Hz/bin 
+// Hz per bin = sample_rate/hz / FFT size => 43.875 Hz/bin 
 #define AUDIO_FRAME_SIZE 1024 // For accurate visual-EQ bin behavior
 
 #include <stdbool.h>

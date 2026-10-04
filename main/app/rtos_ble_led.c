@@ -16,7 +16,6 @@
 #include "led/led_matrix_renderer.h"
 #include "ble/ble_telemetry.h"
 #include "dsp/audio_buffer.h"
-#include "dsp/dft_engine.h"
 #include "dsp/fft_engine.h"
 #include "dsp/audio_dsp_pipeline.h"
 #include "test/self_test.h"
@@ -24,8 +23,8 @@
 #include "common/app_log.h"
 
 _Static_assert(AUDIO_FRAME_SIZE == 1024, "Unexpected AUDIO_FRAME_SIZE");
-_Static_assert(AUDIO_FRAME_SIZE == DFT_FRAME_SIZE,
-"AUDIO_FRAME_SIZE must equal DFT_FRAME_SIZE");
+_Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
+"AUDIO_FRAME_SIZE must equal FFT_FRAME_SIZE");
 
 #define DSP_SELF_TEST_MODE 1
 #define DSP_DEBUG_LOGS 1
@@ -46,7 +45,7 @@ _Static_assert(AUDIO_FRAME_SIZE == DFT_FRAME_SIZE,
 static const char *LOG_TAG = "rtos_ble_led";
 static led_strip_handle_t s_led_strip = NULL; 
 static i2s_chan_handle_t s_i2s_rx_chan = NULL;
-static uint32_t s_dft_frame_counter = 0; // Frame counter for rate-limited logs
+static uint32_t s_fft_frame_counter = 0; // Frame counter for rate-limited logs
 
 typedef struct
 {
@@ -135,7 +134,7 @@ static esp_err_t mic_read_and_push_samples(void)
       // If 23-bit sign bit is 1
       if ((sample32 & 0x00800000) != 0) sample32 |= 0xFF000000;
 
-      // Downscale to int16_t for current audio buffer/DFT path
+      // Downscale to int16_t for current audio buffer/FFT path
       int16_t sample16 = (int16_t)(sample32 >> 8); // Proper resolution reduction
       audio_buffer_push_sample(sample16);
    }
@@ -274,7 +273,7 @@ static void audio_log_dsp_debug(const float *bands_norm)
    esp_err_t status = audio_dsp_get_peak_frequency(&peak_hz, &peak_bin, &peak_mag);
    if (status == ESP_OK)
    {
-      ESP_LOGI(LOG_TAG, "dft_peak: bin=%u hz=%.2f mag=%.2f",
+      ESP_LOGI(LOG_TAG, "fft_peak: bin=%u hz=%.2f mag=%.2f",
          (unsigned)peak_bin,
          peak_hz,
          peak_mag);
@@ -335,21 +334,13 @@ static void audio_update_ble_snapshot(const float *bands_norm)
    if (status != ESP_OK) app_log_error(LOG_TAG, "ble_telemetry_update_snapshot", status);
 }
 
-// Live mic -> audio buffer -> DFT -> bands
-static void audio_dft_live_task(void *arg)
+// Live mic -> audio buffer -> FFT -> bands
+static void audio_fft_live_task(void *arg)
 {
    (void)arg;
    audio_buffer_init();
 
-   esp_err_t status = dft_engine_init();
-   app_log_error(LOG_TAG, "dft_engine_init", status);
-   if (status != ESP_OK)
-   {
-      vTaskDelete(NULL);
-      return;
-   }
-
-   status = fft_engine_init();
+   esp_err_t status = fft_engine_init();
    app_log_error(LOG_TAG, "fft_engine_init", status);
    if (status != ESP_OK)
    {
@@ -386,12 +377,12 @@ static void audio_dft_live_task(void *arg)
       }
 
       s_no_frame_count = 0;
-      s_dft_frame_counter++;
+      s_fft_frame_counter++;
       audio_publish_bands_to_led_queue(bands_norm);
       audio_update_ble_snapshot(bands_norm); // Data for BLE advertisement packet
 
       // Throttle DSP/log path: keep 1 in 8 processed frames for display/log
-      if ((s_dft_frame_counter % 8U) != 0U)
+      if ((s_fft_frame_counter % 8U) != 0U)
       {
          vTaskDelay(pdMS_TO_TICKS(5));
          continue;
@@ -520,9 +511,9 @@ void app_main(void)
    return;
    #endif
 
-   if (xTaskCreatePinnedToCore(audio_dft_live_task, "audio_dft_live_task", 6144, NULL, 4, NULL, 1) != pdPASS)
+   if (xTaskCreatePinnedToCore(audio_fft_live_task, "audio_fft_live_task", 6144, NULL, 4, NULL, 1) != pdPASS)
    {
-      ESP_LOGE(LOG_TAG, "Failed to create audio_dft_live_task");
+      ESP_LOGE(LOG_TAG, "Failed to create audio_fft_live_task");
       return;
    }
 
