@@ -4,6 +4,7 @@ idf_component_register(
       "ble/ble_telemetry.c"
       "dsp/audio_buffer.c" 
       "dsp/dft_engine.c"
+      "dsp/fft_engine.c"
       "dsp/dft_trace.c" 
       "dsp/spectrum_map.c" 
       "dsp/audio_dsp_pipeline.c" 

@@ -17,6 +17,7 @@
 #include "ble/ble_telemetry.h"
 #include "dsp/audio_buffer.h"
 #include "dsp/dft_engine.h"
+#include "dsp/fft_engine.h"
 #include "dsp/audio_dsp_pipeline.h"
 #include "test/self_test.h"
 #include "test/gpio4_scope_test.h"
@@ -26,6 +27,7 @@ _Static_assert(AUDIO_FRAME_SIZE == 1024, "Unexpected AUDIO_FRAME_SIZE");
 _Static_assert(AUDIO_FRAME_SIZE == DFT_FRAME_SIZE,
 "AUDIO_FRAME_SIZE must equal DFT_FRAME_SIZE");
 
+#define DSP_SELF_TEST_MODE 1
 #define DSP_DEBUG_LOGS 1
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
@@ -347,6 +349,14 @@ static void audio_dft_live_task(void *arg)
       return;
    }
 
+   status = fft_engine_init();
+   app_log_error(LOG_TAG, "fft_engine_init", status);
+   if (status != ESP_OK)
+   {
+      vTaskDelete(NULL);
+      return;
+   }
+
    static uint32_t s_no_frame_count = 0;
    while (true)
    {
@@ -400,6 +410,27 @@ static void audio_dft_live_task(void *arg)
 
 void app_main(void)
 {
+   #if DSP_SELF_TEST_MODE
+      ESP_LOGI(LOG_TAG, "Running DSP self-test...");
+
+      esp_err_t self_test_status = self_test_run_all();
+
+      if (self_test_status != ESP_OK)
+      {
+         ESP_LOGE(
+            LOG_TAG,
+            "DSP self-test FAILED: %s",
+            esp_err_to_name(self_test_status)
+         );
+      }
+      else
+      {
+         ESP_LOGI(LOG_TAG, "DSP self-test PASSED");
+      }
+      
+      return;
+   #endif
+
    #if GPIO4_SCOPE_TEST_MODE
    esp_err_t gpio_test_status = gpio4_scope_test_start(GPIO4_SCOPE_TEST_STEADY_HIGH != 0);
    if (gpio_test_status != ESP_OK)

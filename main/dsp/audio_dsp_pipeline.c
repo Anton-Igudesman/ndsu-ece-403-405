@@ -5,6 +5,7 @@
 #include "esp_log.h"
 #include "audio_buffer.h"
 #include "dft_engine.h"
+#include "fft_engine.h"
 #include "audio_dsp_pipeline.h"
 
 #define AUDIO_SAMPLE_RATE_HZ 48000.0f

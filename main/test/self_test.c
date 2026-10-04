@@ -12,6 +12,7 @@
 
 #include "dsp/audio_buffer.h"
 #include "dsp/dft_engine.h"
+#include "dsp/fft_engine.h"
 #include "dsp/spectrum_map.h"
 #include "common/math_constants.h"
 
@@ -70,66 +71,114 @@ esp_err_t self_test_log_eq_columns_text(
    return ESP_OK;
 }
 
-
-// Test creation of frame out of audio samples
-static esp_err_t audio_buffer_self_test(void)
+static esp_err_t run_dft_test(
+   const int16_t *frame,
+   const float **mags_out,
+   size_t *bins_out
+)
 {
-   audio_buffer_init();
-
-   // Push audio samples to complete a frame
-   for (size_t i = 0; i < AUDIO_FRAME_SIZE; i++)
-   {
-      // Two-tone test signal
-      float x1 = 1200.0f * sinf((MATH_TWO_PI * 4.0f * (float)i) / (float)AUDIO_FRAME_SIZE);
-      float x2 = 700.0f  * sinf((MATH_TWO_PI * 20.0f * (float)i) / (float)AUDIO_FRAME_SIZE);
-      int16_t sample = (int16_t)(x1 + x2);
-
-      audio_buffer_push_sample(sample);
-   }
-
-   const int16_t *frame = NULL; // Will be pointer 
-   
-   // Create full frame from audio samples
-   esp_err_t status = audio_buffer_try_get_frame(&frame);
-   app_log_error(LOG_TAG, "audio_buffer_try_get_frame", status);
-   if (status != ESP_OK || frame == NULL) return ESP_ERR_INVALID_STATE;
-   
-   ESP_LOGI(LOG_TAG, "audio_buffer self-test OK: n=%u first=%d last=%d",
-      (unsigned)AUDIO_FRAME_SIZE,
-      frame[0],
-      frame[AUDIO_FRAME_SIZE - 1]);
-   
    /*
       1) Init DFT engine
       2) Process a frame
       3) Get magnitudes from bins
    */
-   status = dft_engine_init();
+
+   if (frame == NULL || mags_out == NULL || bins_out == NULL) return ESP_ERR_INVALID_ARG;
+
+   esp_err_t status = dft_engine_init();
    app_log_error(LOG_TAG, "dft_engine_init", status); // Status of dft_ingine_init
    if (status != ESP_OK) return status;
 
-   status = dft_engine_process_frame(frame); // process frame
+   status = dft_engine_process_frame(frame);
    app_log_error(LOG_TAG, "dft_engine_process_frame", status);
    if (status != ESP_OK) return status;
-
-   size_t bins = 0;
-   const float *mags = NULL;
-   status = dft_engine_get_magnitudes(&mags, &bins);
-   app_log_error(LOG_TAG, "dft_engine_get_magnitudes", status);
-   if (status != ESP_OK || mags == NULL || bins == 0) return ESP_ERR_INVALID_STATE;
    
-   float mag0 = mags[0];
-   float mag1 = (bins > 1) ? mags[1] : 0.0f;
+   status = dft_engine_get_magnitudes(mags_out, bins_out);
+   app_log_error(LOG_TAG, "dft_engine_get_magnitudes", status);
+   if (status != ESP_OK) return status; 
+   if (*mags_out == NULL || *bins_out == 0) return ESP_ERR_INVALID_STATE;
 
-   ESP_LOGI(LOG_TAG, "dft placeholder OK: bins=%u mag0=%.1f mag1=%.1f",
-      (unsigned)bins,
-      mag0,
-      mag1);
+   return ESP_OK;
+}
+
+static esp_err_t run_fft_test(
+   const int16_t *frame,
+   const float **mags_out,
+   size_t *bins_out
+)
+{
+   if (frame == NULL || mags_out == NULL || bins_out == NULL) return ESP_ERR_INVALID_ARG;
+
+   esp_err_t status = fft_engine_init();
+   app_log_error(LOG_TAG, "fft_engine_init", status);
+   if (status != ESP_OK) return status;
+
+   status = fft_engine_process_frame(frame);
+   app_log_error(LOG_TAG, "fft_engine_process_frame", status);
+   if (status != ESP_OK) return status;
+
+   status = fft_engine_get_magnitudes(mags_out, bins_out);
+   app_log_error(LOG_TAG, "fft_engine_get_magnitudes", status);
+   if (status != ESP_OK) return status;
+   if (*mags_out == NULL || *bins_out == 0) return ESP_ERR_INVALID_STATE;
+
+   return ESP_OK;
+}
+
+static esp_err_t generate_test_audio_frame(
+   const size_t *test_bins,
+   const float *test_amplitudes,
+   size_t test_tone_count,
+   const int16_t **frame_out
+)
+{
+   if (test_bins == NULL ||
+      test_amplitudes == NULL ||
+      test_tone_count == 0 ||
+      frame_out == NULL) return ESP_ERR_INVALID_ARG;
+
+   for (size_t i = 0; i < AUDIO_FRAME_SIZE; i++)
+   {
+      float sample_sum = 0.0f;
+
+      // Building test signal
+      for (size_t tone = 0; tone < test_tone_count; tone++)
+      {
+         sample_sum += test_amplitudes[tone] * sinf(
+            (MATH_TWO_PI * (float)test_bins[tone] * (float)i) /
+         (float)AUDIO_FRAME_SIZE
+         );
+      }
+
+      int16_t sample = (int16_t)sample_sum;
+      audio_buffer_push_sample(sample);
+   } 
+   
+   // Create full frame from audio samples
+   esp_err_t status = audio_buffer_try_get_frame(frame_out);
+   app_log_error(LOG_TAG, "audio_buffer_try_get_frame", status);
+   if (status != ESP_OK) return status;
+   if (*frame_out == NULL) return ESP_ERR_INVALID_STATE;
+   
+   ESP_LOGI(LOG_TAG, "audio_buffer self-test OK: n=%u first=%d last=%d",
+      (unsigned)AUDIO_FRAME_SIZE,
+      (*frame_out)[0],
+      (*frame_out)[AUDIO_FRAME_SIZE - 1]);
+
+   return ESP_OK;
+}
+
+static esp_err_t test_spectrum_mapping(
+   const float *mags,
+   size_t bins
+)
+{
+   if (mags == NULL || bins == 0) return ESP_ERR_INVALID_ARG;
 
    // Map bins into 8 frequency bands for LED mapping
    float bands[SPECTRUM_NUM_BANDS] = {0}; // 8-band output buffer
 
-   status = spectrum_map_bins_to_bands(
+   esp_err_t status = spectrum_map_bins_to_bands(
       mags,
       bins,
       bands,
@@ -158,6 +207,244 @@ static esp_err_t audio_buffer_self_test(void)
       bands_norm[0], bands_norm[1], bands_norm[2], bands_norm[3],
       bands_norm[4], bands_norm[5], bands_norm[6], bands_norm[7]);
 
+   return ESP_OK;
+}
+
+static void log_transform_test_result(
+   const char *transform_name,
+   const float *mags,
+   size_t bins
+)
+{
+   if (transform_name == NULL || mags == NULL || bins == 0) return;
+
+   float mag0 = mags[0];
+   float mag1 = (bins > 1) ? mags[1] : 0.0f;
+
+   ESP_LOGI(
+      LOG_TAG, 
+      "%s test OK: bins=%u mag0=%.1f mag1=%.1f",
+      transform_name,
+      (unsigned)bins,
+      mag0,
+      mag1);
+}
+
+static esp_err_t compare_dft_fft(
+   const float *dft_mags,
+   size_t dft_bins,
+   const float *fft_mags,
+   size_t fft_bins
+)
+{
+   if (dft_mags == NULL || fft_mags == NULL) return ESP_ERR_INVALID_ARG;
+   if (dft_bins == 0 || fft_bins == 0) return ESP_ERR_INVALID_ARG;
+
+   // Bin count check
+   if (dft_bins != fft_bins)
+   {
+      ESP_LOGE(
+         LOG_TAG,
+         "DFT/FFT bin count mismatch: DFT=%u FFT=%u",
+         (unsigned)dft_bins,
+         (unsigned)fft_bins
+      );
+
+      return ESP_FAIL;
+   }
+
+   float max_abs_diff = 0.0f;
+   size_t max_diff_bin = 0;
+
+   // Loop through bins and remember the WORST disagreement
+   for (size_t k = 0; k < dft_bins; k++)
+   {
+      float abs_diff = fabsf(dft_mags[k] - fft_mags[k]);
+
+      if (abs_diff > max_abs_diff)
+      {
+         max_abs_diff = abs_diff;
+         max_diff_bin = k;
+      }
+   }
+
+   float dft_value = dft_mags[max_diff_bin];
+   float fft_value = fft_mags[max_diff_bin];
+
+   float relative_error = 0.0f;
+   if (fabsf(dft_value) > 0.0f) relative_error = max_abs_diff / fabsf(dft_value);
+
+   // Fail validation if DFT/FFT differ by more than 0.1%
+   const float max_relative_error = 0.001f;
+
+   if (relative_error > max_relative_error)
+   {
+      ESP_LOGE(
+         LOG_TAG,
+         "DFT/FFT validation FAILED: relative error %.6f%% exceeds %.3f%%",
+         relative_error * 100.0f,
+         max_relative_error * 100.0f
+      );
+
+      return ESP_FAIL;
+   }
+
+   ESP_LOGI(
+      LOG_TAG,
+      "DFT/FFT comparison: bin=%u DFT=%.3f FFT=%.3f abs_diff=%.3f relative_error=%.6f%%",
+      (unsigned)max_diff_bin,
+      dft_value,
+      fft_value,
+      max_abs_diff,
+      relative_error * 100.0f
+   );
+
+   return ESP_OK;
+}
+
+static esp_err_t validate_expected_peaks(
+   const char *transform_name,
+   const float *mags,
+   size_t bins,
+   const size_t *expected_bins,
+   size_t expected_bin_count
+)
+{
+   if (transform_name == NULL ||
+      mags == NULL || 
+      expected_bins == NULL ||
+      bins == 0 ||
+      expected_bin_count == 0) return ESP_ERR_INVALID_ARG;
+
+   for (size_t i = 0; i < expected_bin_count; i++)
+   {
+      if (expected_bins[i] >= bins)
+      {
+         ESP_LOGE(
+            LOG_TAG,
+            "%s expected bin %u is outside available bins=%u",
+            transform_name,
+            (unsigned)expected_bins[i],
+            (unsigned)bins
+         );
+
+         return ESP_ERR_INVALID_ARG;
+      }
+
+      size_t expected_bin = expected_bins[i];
+      float expected_mag = mags[expected_bin];
+
+      float left_mag = (expected_bin > 0) ?
+         mags[expected_bin - 1] : 0.0f;
+
+      float right_mag = (expected_bin + 1 < bins) ?
+         mags[expected_bin + 1] : 0.0f;
+
+      if (expected_mag <= left_mag || expected_mag <= right_mag)
+      {
+         ESP_LOGE(
+            LOG_TAG,
+            "%s expected peak FAILED at bin=%u: left=%.3f peak=%.3f right=%.3f",
+            transform_name,
+            (unsigned)expected_bin,
+            left_mag,
+            expected_mag,
+            right_mag
+         );
+
+         return ESP_FAIL;
+      }
+
+      ESP_LOGI(
+         LOG_TAG,
+         "%s expected peak PASSED at bin=%u: left=%.3f peak=%.3f right=%.3f",
+         transform_name,
+         (unsigned)expected_bin,
+         left_mag,
+         expected_mag,
+         right_mag
+      );
+   }
+   return ESP_OK;
+}
+
+static esp_err_t audio_buffer_self_test(void)
+{
+   audio_buffer_init();
+   
+   const size_t expected_bins[] = {4, 20};
+   const float test_amplitudes[] = {1200.0f, 700.0f};
+   const size_t expected_bin_count = sizeof(expected_bins) / sizeof(expected_bins[0]);
+
+   const int16_t *frame = NULL;
+   // Push audio samples to complete a frame
+   esp_err_t status = generate_test_audio_frame(
+      expected_bins,
+      test_amplitudes,
+      expected_bin_count,
+      &frame
+   );
+   if (status != ESP_OK) return status;
+
+   size_t dft_bins = 0;
+   const float *dft_mags = NULL;
+
+   // -------------------------------
+   // ---- DFT/FFT validation ----
+   // -------------------------------
+
+   status = run_dft_test(
+      frame,
+      &dft_mags,
+      &dft_bins
+   );
+   if (status != ESP_OK) return status;
+   log_transform_test_result("DFT", dft_mags, dft_bins);
+
+   status = validate_expected_peaks(
+      "DFT",
+      dft_mags,
+      dft_bins,
+      expected_bins,
+      expected_bin_count
+   );
+   if (status != ESP_OK) return status;
+
+   size_t fft_bins = 0;
+   const float *fft_mags = NULL;
+
+   status = run_fft_test(
+      frame,
+      &fft_mags,
+      &fft_bins
+   );
+   if (status != ESP_OK) return status;
+   log_transform_test_result("FFT", fft_mags, fft_bins);
+
+   status = validate_expected_peaks(
+      "FFT",
+      fft_mags,
+      fft_bins,
+      expected_bins,
+      expected_bin_count
+   );
+   if (status != ESP_OK) return status;
+
+   status = compare_dft_fft(
+      dft_mags,
+      dft_bins,
+      fft_mags,
+      fft_bins
+   );
+
+   if (status != ESP_OK) return status;
+
+   status = test_spectrum_mapping(
+      dft_mags,
+      dft_bins
+   );
+   if (status != ESP_OK) return status;
+   
    return ESP_OK;
 }
 
