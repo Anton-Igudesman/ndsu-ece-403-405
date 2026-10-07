@@ -7,6 +7,7 @@
 #include <stdio.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -14,7 +15,18 @@
 #include "dsp/dft_engine.h"
 #include "dsp/fft_engine.h"
 #include "dsp/spectrum_map.h"
+#include "led/led_cube_mapper.h"
 #include "common/math_constants.h"
+
+typedef struct
+{
+   size_t x;
+   size_t y;
+   size_t z;
+   size_t expected_layer;
+   size_t expected_pixel_index;
+} cube_mapper_test_case_t;
+
 
 static const char *LOG_TAG = "self_test";
 static i2s_chan_handle_t s_test_i2s_rx_chan = NULL;
@@ -71,6 +83,38 @@ esp_err_t self_test_log_eq_columns_text(
    return ESP_OK;
 }
 
+typedef esp_err_t (*transform_process_fn_t)(const int16_t *frame);
+
+static esp_err_t run_timed_transform(
+   const char *transform_name,
+   transform_process_fn_t process_fn,
+   const int16_t *frame
+)
+{
+   if (transform_name == NULL ||
+      process_fn == NULL ||
+      frame == NULL) return ESP_ERR_INVALID_ARG;
+   
+   int64_t start_us = esp_timer_get_time();
+
+   // Callback
+   esp_err_t status = process_fn(frame);
+
+   int64_t elapsed_us = esp_timer_get_time() - start_us;
+
+   app_log_error(LOG_TAG, transform_name, status);
+   if (status != ESP_OK) return status;
+
+   ESP_LOGI(
+      LOG_TAG,
+      "%s process time: %lld us",
+      transform_name,
+      (long long)elapsed_us
+   );
+
+   return ESP_OK;
+}
+
 static esp_err_t run_dft_test(
    const int16_t *frame,
    const float **mags_out,
@@ -89,8 +133,11 @@ static esp_err_t run_dft_test(
    app_log_error(LOG_TAG, "dft_engine_init", status); // Status of dft_ingine_init
    if (status != ESP_OK) return status;
 
-   status = dft_engine_process_frame(frame);
-   app_log_error(LOG_TAG, "dft_engine_process_frame", status);
+   status = run_timed_transform(
+      "DFT",
+      dft_engine_process_frame,
+      frame
+   );
    if (status != ESP_OK) return status;
    
    status = dft_engine_get_magnitudes(mags_out, bins_out);
@@ -113,8 +160,11 @@ static esp_err_t run_fft_test(
    app_log_error(LOG_TAG, "fft_engine_init", status);
    if (status != ESP_OK) return status;
 
-   status = fft_engine_process_frame(frame);
-   app_log_error(LOG_TAG, "fft_engine_process_frame", status);
+   status = run_timed_transform(
+      "FFT",
+      fft_engine_process_frame,
+      frame
+   );
    if (status != ESP_OK) return status;
 
    status = fft_engine_get_magnitudes(mags_out, bins_out);
@@ -368,6 +418,66 @@ static esp_err_t validate_expected_peaks(
    return ESP_OK;
 }
 
+static esp_err_t led_cube_mapper_self_test(void)
+{
+   const cube_mapper_test_case_t test_cases[] =
+   {
+   {0, 0, 0, 0, 0},    // LED 1
+   {7, 0, 0, 0, 7},    // LED 8
+   {7, 1, 0, 0, 8},    // LED 9
+   {0, 1, 0, 0, 15},   // LED 16
+   {0, 2, 0, 0, 16},   // LED 17
+   {7, 2, 0, 0, 23},   // LED 24
+   {7, 3, 0, 0, 24},   // LED 25
+   {0, 3, 0, 0, 31},   // LED 32
+   {0, 7, 0, 0, 63},   // LED 64
+   {3, 4, 6, 6, 35}    // Arbitrary XYZ/layer check
+};
+
+   const size_t test_case_count = sizeof(test_cases) / sizeof(test_cases[0]);
+
+   for (size_t i = 0; i < test_case_count; i++)
+   {
+      size_t layer = 0;
+      size_t pixel_index = 0;
+
+      esp_err_t status = led_cube_map_voxel(
+         test_cases[i].x,
+         test_cases[i].y,
+         test_cases[i].z,
+         &layer,
+         &pixel_index
+      );
+      if (status != ESP_OK) return status;
+
+      if (layer != test_cases[i].expected_layer ||
+         pixel_index != test_cases[i].expected_pixel_index)
+      {
+         ESP_LOGE(
+            LOG_TAG,
+            "cube mapper FAILED: (%u,%u,%u) -> layer=%u index=%u, expected layer=%u index=%u",
+            (unsigned)test_cases[i].x,
+            (unsigned)test_cases[i].y,
+            (unsigned)test_cases[i].z,
+            (unsigned)layer,
+            (unsigned)pixel_index,
+            (unsigned)test_cases[i].expected_layer,
+            (unsigned)test_cases[i].expected_pixel_index
+         );
+
+         return ESP_FAIL;
+      }
+   }
+
+   ESP_LOGI(
+      LOG_TAG,
+      "cube mapper self-test PASSED: %u cases",
+      (unsigned)test_case_count
+   );
+
+   return ESP_OK;
+}
+
 static esp_err_t audio_buffer_self_test(void)
 {
    audio_buffer_init();
@@ -579,5 +689,11 @@ esp_err_t self_test_start_mic_monitor(i2s_chan_handle_t rx_chan)
 // Future target for testing suite
 esp_err_t self_test_run_all(void)
 {
-   return audio_buffer_self_test();
+   esp_err_t status = led_cube_mapper_self_test();
+   if (status!= ESP_OK) return status;
+
+   // status = audio_buffer_self_test();
+   // if (status != ESP_OK) return status;
+
+   return ESP_OK;
 }

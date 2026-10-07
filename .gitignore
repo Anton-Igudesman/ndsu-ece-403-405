@@ -15,6 +15,7 @@
 
 # Project documentation drafts
 /docs/
+docs.zip
 
 # CMake/compile db noise (if generated at repo root)
 /CMakeFiles/
