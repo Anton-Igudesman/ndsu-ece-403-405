@@ -4,7 +4,7 @@
 #include<stdint.h>
 
 #include "esp_err.h"
-
+#include "led_cube.h"
 
 /*
    Render an 8-band audio spectrum into the 8x8x8 LED cube.
@@ -21,14 +21,6 @@
       middle levels = yellow
       upper levels  = red
 */
-esp_err_t led_cube_render_eq(const float *bands_norm);
-
-typedef struct
-{
-   uint8_t red;
-   uint8_t green;
-   uint8_t blue;
-} led_cube_color_t;
 
 typedef struct
 {

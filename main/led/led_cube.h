@@ -48,6 +48,13 @@ esp_err_t led_cube_set_voxel(
    uint8_t blue
 );
 
+typedef struct
+{
+   uint8_t red;
+   uint8_t green;
+   uint8_t blue;
+} led_cube_color_t;
+
 /*
    Clear all 512 logical voxels.
 

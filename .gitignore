@@ -1,5 +1,6 @@
 # ESP-IDF build output
 /build/
+**/build/
 /sdkconfig.old
 
 # ESP-IDF managed dependencies (reproducible via dependencies.lock)

@@ -12,8 +12,10 @@
 
 // Custom headers
 #include "led/led_protocol.h"
-#include "led/led_effects.h"
-#include "led/led_matrix_renderer.h"
+#include "led/led_cube.h"
+#include "led/led_cube_renderer.h"
+#include "led_effects.h"
+#include "led_effect_pockets.h"
 #include "ble/ble_telemetry.h"
 #include "dsp/audio_buffer.h"
 #include "dsp/fft_engine.h"
@@ -31,19 +33,38 @@ _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
-#define LED_GPIO GPIO_NUM_4
 #define LED_AUDIO_QUEUE_LEN 1U // Queue consists of 1 processed audio frame
-#define RGB_LED_INDEX 0
 #define LED_DEFAULT_BLINK_MS 500
 #define LED_CMD_QUEUE_LEN 8
 #define LED_ON 1
 #define LED_OFF 0
-#define MATRIX_WIDTH 8
-#define MATRIX_HEIGHT 8
-#define MATRIX_PIXELS (MATRIX_WIDTH * MATRIX_HEIGHT)
+
+// ---------------------------------
+// -- Pin assignment for DIN lines--
+// ---------------------------------
+#define CUBE_LAYER_0_GPIO GPIO_NUM_4
+#define CUBE_LAYER_1_GPIO GPIO_NUM_5
+#define CUBE_LAYER_2_GPIO GPIO_NUM_6
+#define CUBE_LAYER_3_GPIO GPIO_NUM_7
+#define CUBE_LAYER_4_GPIO GPIO_NUM_8
+#define CUBE_LAYER_5_GPIO GPIO_NUM_9
+#define CUBE_LAYER_6_GPIO GPIO_NUM_10
+#define CUBE_LAYER_7_GPIO GPIO_NUM_11
+
+static const gpio_num_t s_cube_layer_gpios[LED_CUBE_SIZE] =
+{
+   CUBE_LAYER_0_GPIO,
+   CUBE_LAYER_1_GPIO,
+   CUBE_LAYER_2_GPIO,
+   CUBE_LAYER_3_GPIO,
+   CUBE_LAYER_4_GPIO,
+   CUBE_LAYER_5_GPIO,
+   CUBE_LAYER_6_GPIO,
+   CUBE_LAYER_7_GPIO
+};
 
 static const char *LOG_TAG = "rtos_ble_led";
-static led_strip_handle_t s_led_strip = NULL; 
+static led_strip_handle_t s_cube_layer_strips[LED_CUBE_SIZE] = {0};
 static i2s_chan_handle_t s_i2s_rx_chan = NULL;
 static uint32_t s_fft_frame_counter = 0; // Frame counter for rate-limited logs
 
@@ -142,8 +163,6 @@ static esp_err_t mic_read_and_push_samples(void)
    return ESP_OK;
 }
 
-
-
 // Own mode dispatch for LED patterns
 static esp_err_t led_process_mode_step(
    led_mode_t mode,
@@ -159,8 +178,9 @@ static esp_err_t led_process_mode_step(
    {
       *led_level = !(*led_level);
 
-      status = led_effects_set_color_level(LED_COLOR_RED, *led_level);
-      log_effect_status("led_effects_set_color_level", status);
+      // Legacy single-LED effect control removed during cube effects refactor
+      //status = led_effects_set_color_level(LED_COLOR_RED, *led_level);
+      //log_effect_status("led_effects_set_color_level", status);
 
       ESP_LOGI(LOG_TAG, "led state is %d", *led_level);
    }
@@ -174,8 +194,14 @@ static esp_err_t led_process_mode_step(
 
    else if (mode == LED_MODE_AUDIO_EQ)
    {
-      status = led_matrix_render_eq(latest_audio->bands_norm);
-      if (status != ESP_OK) log_effect_status("led_matrix_render_eq", status);
+      status = led_cube_render_eq(latest_audio->bands_norm);
+      if (status != ESP_OK) log_effect_status("led_cube_render_eq", status);
+   }
+
+   else if (mode == LED_MODE_POCKETS)
+   {
+      status = led_effect_pockets_step();
+      if (status != ESP_OK) log_effect_status("led_effect_pockets_step", status);
    }
 
    else return ESP_ERR_INVALID_ARG;
@@ -304,8 +330,47 @@ static void audio_log_dsp_debug(const float *bands_norm)
    else app_log_error(LOG_TAG, "audio_dsp_get_band_peak_frequency", status);
    
 
-   status = self_test_log_eq_columns_text(bands_norm, SPECTRUM_NUM_BANDS, MATRIX_HEIGHT);
+   status = self_test_log_eq_columns_text(bands_norm, SPECTRUM_NUM_BANDS, LED_CUBE_SIZE);
    if (status != ESP_OK) app_log_error(LOG_TAG, "self_test_log_eq_columns_text", status);
+}
+
+static esp_err_t led_cube_hardware_init(void)
+{
+   // Shared RMT configuration used by all eight cube data channels
+   led_strip_rmt_config_t rmt_config = 
+   {
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = 10 * 1000 * 1000,
+      .mem_block_symbols = 64,
+      .flags = {.with_dma = false}
+   };
+
+   // Create one independent WS2812 strip handle for each physical Z layer
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   {
+      led_strip_config_t strip_config = 
+      {
+         .strip_gpio_num = s_cube_layer_gpios[layer],
+         .max_leds = LED_CUBE_LAYER_PIXELS,
+         .led_model = LED_MODEL_WS2812,
+         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+         .flags = {.invert_out = false}
+      };
+
+      esp_err_t status = led_strip_new_rmt_device(
+         &strip_config,
+         &rmt_config,
+         &s_cube_layer_strips[layer]
+      );
+
+      if (status != ESP_OK) return status;
+   }
+
+   // Pass completed physical layer array into logical cube abstraction
+   return led_cube_init(
+      s_cube_layer_strips,
+      LED_CUBE_SIZE
+   );
 }
 
 // Extract targeted stats for BLE advertisement
@@ -431,50 +496,16 @@ void app_main(void)
    return;
    #endif
 
-   // LED strip configuration
-   led_strip_config_t strip_config = {
-      .strip_gpio_num = LED_GPIO,
-      .max_leds = MATRIX_PIXELS,
-      .led_model = LED_MODEL_WS2812,
-      .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-      .flags = {
-         .invert_out = false,
-      },
-   };
+   // Initialize eight physical LED layers and logical cube interface
+   esp_err_t status = led_cube_hardware_init();
 
-   // Transmit settings
-   led_strip_rmt_config_t rmt_config = {
-      .clk_src = RMT_CLK_SRC_DEFAULT,
-      .resolution_hz = 10 * 1000 * 1000,   
-      .mem_block_symbols = 64,
-      .flags = {
-         .with_dma = false,
-      },
-   };
-
-   esp_err_t status = led_strip_new_rmt_device(
-      &strip_config, 
-      &rmt_config, 
-      &s_led_strip);
-
-   ESP_LOGI(LOG_TAG, "new_rmt_device: %d (%s)", status, esp_err_to_name(status));
-    
-   if (status != ESP_OK) {
-      ESP_LOGE(LOG_TAG, "led_strip_new_rmt_device failed");
-      return;
-   }
-
-   status = led_effects_init(s_led_strip, RGB_LED_INDEX);
    if (status != ESP_OK)
    {
-      ESP_LOGE(LOG_TAG, "led_effects_init failed: %s", esp_err_to_name(status));
-      return;
-   }
-
-   status = led_matrix_renderer_init(s_led_strip);
-   if (status != ESP_OK)
-   {
-      ESP_LOGE(LOG_TAG, "led_matrix_renderer_init failed: %s", esp_err_to_name(status));
+      ESP_LOGE(
+         LOG_TAG,
+         "led_cube_hardware_init failed: %s",
+         esp_err_to_name(status)
+      );
       return;
    }
 

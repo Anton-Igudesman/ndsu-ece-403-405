@@ -11,6 +11,7 @@ typedef enum
    LED_MODE_BREATHE,
    LED_MODE_ON_SOLID,
    LED_MODE_AUDIO_EQ,
+   LED_MODE_POCKETS,
    LED_MODE_OFF
 } led_mode_t;
 

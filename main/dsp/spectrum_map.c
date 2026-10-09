@@ -23,13 +23,12 @@ esp_err_t spectrum_map_bins_to_bands(
       bins are not 0 indexed to avoid log(0) situations
       edges are uniform in log-space, then projected back to index-space
    */
-   const float min_bin_index_f = 1.0f;
    const float max_bin_index_f = (float)num_bins;
 
-   // uniform bands in log-space
-   const float log_min = logf(min_bin_index_f);
+   // Maximum log-space position used to calculate band boundaries
    const float log_max = logf(max_bin_index_f);
    bool trace_this_call = false;
+
 #if SPECTRUM_MAP_TRACE_LOGS
    s_spectrum_map_trace_counter++;
    trace_this_call = ((s_spectrum_map_trace_counter % SPECTRUM_MAP_TRACE_DIVISOR) == 0U);
@@ -41,8 +40,8 @@ esp_err_t spectrum_map_bins_to_bands(
       const float t0 = (float)band / (float)num_bands;
       const float t1 = (float)(band + 1U) / (float)num_bands;
 
-      size_t start = (size_t)floorf(expf(log_min + t0 * (log_max - log_min)));
-      size_t end = (size_t)floorf(expf(log_min + t1 * (log_max - log_min)));
+      size_t start = (size_t)floorf(expf(t0 * log_max));
+      size_t end = (size_t)floorf(expf(t1 * log_max));
 
       // Clamp indices into safe bounds
       if (start >= num_bins) start = num_bins - 1U;
@@ -50,17 +49,16 @@ esp_err_t spectrum_map_bins_to_bands(
 
       // Ensure non-empty interval [start, end)
       if (end <= start) end = start + 1U;
-      if (end > num_bins) end = num_bins;
 
       float sum = 0.0f;
       for (size_t i = start; i < end; i++) sum += bins[i];
-      size_t width = end - start;
-      float mean = sum / (float)width;
 
-      /* 
+       /* 
          Band mean:
          bands[band] = (1/M) * sum_{i=start}^{end-1}(bins[i])
       */
+      size_t width = end - start;
+      float mean = sum / (float)width;
       bands[band] = mean;
 
       if (trace_this_call)
@@ -109,5 +107,4 @@ esp_err_t spectrum_map_normalize_bands(
    // bands_out[i] = bands_in[i] / max_value
    for (size_t i = 0; i < num_bands; i++) bands_out[i] = bands_in[i] / max_value;
    return ESP_OK;
-   
 }
