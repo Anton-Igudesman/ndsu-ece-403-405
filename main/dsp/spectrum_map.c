@@ -8,6 +8,100 @@
 static const char *LOG_TAG = "spectrum_map";
 static uint32_t s_spectrum_map_trace_counter = 0;
 
+// ----------------------------------------
+// ----- Private Function Definitions -----
+// ----------------------------------------
+
+// Project one logarithmic band edge into FFT bin index space
+static size_t calculate_log_bin_edge(
+   size_t edge,
+   size_t num_bands,
+   float log_max
+)
+{
+   const float normalized_edge =
+      (float)edge / (float)num_bands;
+
+   return (size_t)floorf(
+      expf(normalized_edge * log_max)
+   );
+}
+
+// Clamp a calculated band range into valid FFT bin boundaries
+static void clamp_band_range(
+   size_t num_bins,
+   size_t *start,
+   size_t *end
+)
+{
+   if (*start >= num_bins) *start = num_bins - 1U;
+   if (*end > num_bins) *end = num_bins;
+
+   // Guarantee a non-empty interval using [start, end)
+   if (*end <= *start) *end = *start + 1U;
+}
+
+// Calculate the mean magnitude of all FFT bins within [start, end)
+static float calculate_band_mean(
+   const float *bins,
+   size_t start,
+   size_t end
+)
+{
+   float sum = 0.0f;
+
+   for (size_t i = start; i < end; i++) sum += bins[i];
+   
+   const size_t width = end - start;
+
+   return sum / (float)width;
+}
+
+// Calculate the FFT bin range assigned to one logarithmically spaced frequency band
+esp_err_t spectrum_map_get_band_range(
+   size_t num_bins,
+   size_t num_bands,
+   size_t band,
+   size_t *start_out,
+   size_t *end_out
+)
+{
+   // Validate spectrum dimensions, requested band, and output pointers
+   if (num_bins == 0 || num_bands == 0) return ESP_ERR_INVALID_ARG;
+   if (num_bands > num_bins) return ESP_ERR_INVALID_ARG;
+   if (band >= num_bands) return ESP_ERR_INVALID_ARG;
+   if (start_out == NULL || end_out == NULL) return ESP_ERR_INVALID_ARG;
+
+   // Establish upper boundary of logarithmic bin space
+   const float log_max = logf((float)num_bins);
+
+   // Calculate the left and right FFT bin edges for this band
+   size_t start = calculate_log_bin_edge(
+      band,
+      num_bands,
+      log_max
+   );
+
+   size_t end = calculate_log_bin_edge(
+      band + 1U,
+      num_bands,
+      log_max
+   );
+
+   // Keep the calculated interval inside valid FFT bin boundaries
+   clamp_band_range(
+      num_bins,
+      &start,
+      &end
+   );
+
+   // Return the calculated bin interval to the caller
+   *start_out = start;
+   *end_out = end;
+
+   return ESP_OK;
+}
+
 esp_err_t spectrum_map_bins_to_bands(
     const float *bins,
     size_t num_bins,
@@ -18,15 +112,6 @@ esp_err_t spectrum_map_bins_to_bands(
    if (num_bins == 0 || num_bands == 0) return ESP_ERR_INVALID_ARG;
    if (num_bands > num_bins) return ESP_ERR_INVALID_ARG;
 
-   /*
-      Log-spaced bin mapping:
-      bins are not 0 indexed to avoid log(0) situations
-      edges are uniform in log-space, then projected back to index-space
-   */
-   const float max_bin_index_f = (float)num_bins;
-
-   // Maximum log-space position used to calculate band boundaries
-   const float log_max = logf(max_bin_index_f);
    bool trace_this_call = false;
 
 #if SPECTRUM_MAP_TRACE_LOGS
@@ -36,75 +121,42 @@ esp_err_t spectrum_map_bins_to_bands(
    
    for (size_t band = 0; band < num_bands; band++) 
    {
-      // Compute band's L/R edges on a log scale
-      const float t0 = (float)band / (float)num_bands;
-      const float t1 = (float)(band + 1U) / (float)num_bands;
+      size_t start = 0U;
+      size_t end = 0U;
 
-      size_t start = (size_t)floorf(expf(t0 * log_max));
-      size_t end = (size_t)floorf(expf(t1 * log_max));
+      // Get the logarithmically spaced FFT bin range for this band
+      esp_err_t status = spectrum_map_get_band_range(
+         num_bins,
+         num_bands,
+         band,
+         &start,
+         &end
+      );
 
-      // Clamp indices into safe bounds
-      if (start >= num_bins) start = num_bins - 1U;
-      if (end > num_bins) end = num_bins;
+      if (status != ESP_OK) return status;
 
-      // Ensure non-empty interval [start, end)
-      if (end <= start) end = start + 1U;
-
-      float sum = 0.0f;
-      for (size_t i = start; i < end; i++) sum += bins[i];
-
-       /* 
-         Band mean:
-         bands[band] = (1/M) * sum_{i=start}^{end-1}(bins[i])
-      */
-      size_t width = end - start;
-      float mean = sum / (float)width;
-      bands[band] = mean;
+      // Average the FFT magnitudes assigned to this band
+      bands[band] = calculate_band_mean(
+         bins,
+         start,
+         end
+      );
 
       if (trace_this_call)
       {
+         const size_t width = end - start;
+
          ESP_LOGI(
             LOG_TAG,
-            "Band-mapping step (band %u): normalized edges t0=%.3f and t1=%.3f map to bin range [%u, %u); width=%u bins; sum of magnitudes=%.2f; band mean (sum/width)=%.2f",
+            "Band-mapping step (band %u): bin range [%u, %u); width=%u bins; band mean=%.2f",
             (unsigned)band,
-            t0,
-            t1,
             (unsigned)start,
             (unsigned)end,
             (unsigned)width,
-            sum,
-            mean
+            bands[band]
          );
       }
    }
 
-   return ESP_OK;
-}
-
-// Normalization to help drive LED intensity predictable
-esp_err_t spectrum_map_normalize_bands(
-   const float *bands_in,
-   size_t num_bands,
-   float *bands_out)
-{
-   if (bands_in == NULL || bands_out == NULL || num_bands == 0) return ESP_ERR_INVALID_ARG;
-
-   // Compute max value of the current frame for scaling
-   float max_value = 0.0f;
-   for (size_t i = 0; i < num_bands; i++) 
-   {
-      if (bands_in[i] > max_value) max_value = bands_in[i];
-   }
-   
-   // If highest value happens to be 0 - output a zero vector
-   if (max_value <= 0.0f)
-   {
-      for (size_t i = 0; i < num_bands; i++) bands_out[i] = 0.0f;
-      return ESP_OK;
-   }
-
-   // Per-frame normalization:
-   // bands_out[i] = bands_in[i] / max_value
-   for (size_t i = 0; i < num_bands; i++) bands_out[i] = bands_in[i] / max_value;
    return ESP_OK;
 }

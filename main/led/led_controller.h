@@ -15,3 +15,7 @@ esp_err_t led_controller_set_mode(
 
 // Return the currently active LED mode
 led_mode_t led_controller_get_mode(void);
+
+// Dispatch execution to the currently active LED mode
+// Only uses bands_norm in AUDIO_EQ_MODE
+esp_err_t led_controller_dispatch_active_mode(const float *bands_norm);

@@ -13,10 +13,12 @@ esp_err_t spectrum_map_bins_to_bands(
    size_t num_bands
 );
 
-esp_err_t spectrum_map_normalize_bands(
-   const float *bands_in,
+esp_err_t spectrum_map_get_band_range(
+   size_t num_bins,
    size_t num_bands,
-   float *bands_out
+   size_t band,
+   size_t *start_out,
+   size_t *end_out
 );
 
 #endif

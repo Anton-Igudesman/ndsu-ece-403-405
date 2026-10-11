@@ -13,9 +13,8 @@
 // Custom headers
 #include "led/led_protocol.h"
 #include "led/led_cube.h"
+#include "led/led_controller.h"
 #include "led/led_cube_renderer.h"
-#include "led_effects.h"
-#include "led_effect_pockets.h"
 #include "ble/ble_telemetry.h"
 #include "dsp/audio_buffer.h"
 #include "dsp/fft_engine.h"
@@ -34,10 +33,7 @@ _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
 #define LED_AUDIO_QUEUE_LEN 1U // Queue consists of 1 processed audio frame
-#define LED_DEFAULT_BLINK_MS 500
 #define LED_CMD_QUEUE_LEN 8
-#define LED_ON 1
-#define LED_OFF 0
 
 // ---------------------------------
 // -- Pin assignment for DIN lines--
@@ -163,79 +159,23 @@ static esp_err_t mic_read_and_push_samples(void)
    return ESP_OK;
 }
 
-// Own mode dispatch for LED patterns
-static esp_err_t led_process_mode_step(
-   led_mode_t mode,
-   led_audio_frame_t *latest_audio,
-   bool *led_level
-)
-{
-   esp_err_t status = ESP_OK;
-
-   if (latest_audio == NULL || led_level == NULL) return ESP_ERR_INVALID_ARG;
-
-   if (mode == LED_MODE_BLINK)
-   {
-      *led_level = !(*led_level);
-
-      // Legacy single-LED effect control removed during cube effects refactor
-      //status = led_effects_set_color_level(LED_COLOR_RED, *led_level);
-      //log_effect_status("led_effects_set_color_level", status);
-
-      ESP_LOGI(LOG_TAG, "led state is %d", *led_level);
-   }
-
-   else if (mode == LED_MODE_FADE) status = led_effects_fade_step();
-   else if (mode == LED_MODE_BREATHE)
-   {
-      status = led_effects_breathe_step(LED_COLOR_RED, 55, 255);
-      log_effect_status("led_effects_breathe_step", status);
-   }
-
-   else if (mode == LED_MODE_AUDIO_EQ)
-   {
-      status = led_cube_render_eq(latest_audio->bands_norm);
-      if (status != ESP_OK) log_effect_status("led_cube_render_eq", status);
-   }
-
-   else if (mode == LED_MODE_POCKETS)
-   {
-      status = led_effect_pockets_step();
-      if (status != ESP_OK) log_effect_status("led_effect_pockets_step", status);
-   }
-
-   else return ESP_ERR_INVALID_ARG;
-
-   return status;
-}
-
 static void led_task(void *arg)
 {
    (void)arg;
-
-   bool led_level = false;
-   uint32_t blink_period_ms = LED_DEFAULT_BLINK_MS;
-   esp_err_t status = ESP_OK;
-
-   led_mode_t mode = LED_MODE_AUDIO_EQ; // Choose between color fader and blinky
    led_audio_frame_t latest_audio = {0};
 
-   // Based on which LED pattern is set in mode variable above
    while (true)
    {
       // Non-blocking read of latest audio frame - keep last value if none available
       (void)xQueueReceive(s_led_audio_queue, &latest_audio, 0);
 
       // Abstract away LED pattern algorithms
-      status = led_process_mode_step(
-         mode,
-         &latest_audio,
-         &led_level);
+      esp_err_t status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
 
-      if (status != ESP_OK) log_effect_status("led_process_mode_step", status);
+      if (status != ESP_OK) log_effect_status("led_controller_dispatch_active_mode", status);
 
-      if (mode == LED_MODE_BLINK) vTaskDelay(pdMS_TO_TICKS(blink_period_ms));
-      else vTaskDelay(pdMS_TO_TICKS(10));
+      // Run LED mode updates every 10 ms
+      vTaskDelay(pdMS_TO_TICKS(10));
    }
 }
 
@@ -504,6 +444,18 @@ void app_main(void)
       ESP_LOGE(
          LOG_TAG,
          "led_cube_hardware_init failed: %s",
+         esp_err_to_name(status)
+      );
+      return;
+   }
+
+   // Initialize LED controller with default startup mode
+   status = led_controller_init(LED_MODE_POCKETS);
+   if (status != ESP_OK)
+   {
+      ESP_LOGE(
+         LOG_TAG,
+         "led_controller_init failed: %s",
          esp_err_to_name(status)
       );
       return;

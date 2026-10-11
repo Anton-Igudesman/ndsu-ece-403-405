@@ -23,6 +23,40 @@ static float s_last_band_peak_mag[SPECTRUM_NUM_BANDS] = {0};
 static bool s_last_band_peaks_valid = false;
 static uint32_t s_trace_frame_counter = 0;
 
+// Find the strongest FFT bin within the specified interval [start, end)
+static void find_peak_bin(
+   const float *bins,
+   size_t start,
+   size_t end,
+   size_t *peak_index_out,
+   float *peak_magnitude_out
+)
+{
+   size_t peak_index = start;
+   float peak_magnitude = bins[start];
+
+   for (size_t i = start + 1U; i < end; i++)
+   {
+      if (bins[i] > peak_magnitude)
+      {
+         peak_magnitude = bins[i];
+         peak_index = i;
+      }
+   }
+
+   *peak_index_out = peak_index;
+   *peak_magnitude_out = peak_magnitude;
+}
+
+// Convert an FFT bin index into its corresponding frequency in Hz
+static float fft_bin_to_hz(size_t bin_index)
+{
+   const float hz_per_bin =
+      AUDIO_SAMPLE_RATE_HZ / (float)FFT_FRAME_SIZE;
+
+   return (float)bin_index * hz_per_bin;
+}
+
 // API serves consumers that need latest frequency state
 esp_err_t audio_dsp_get_last_band_peaks(
    float *band_peak_hz_out,
@@ -109,6 +143,7 @@ esp_err_t audio_dsp_get_band_peak_frequency(
    // No usable spectrum data
    if (mags == NULL || bins == 0) return ESP_ERR_INVALID_STATE;
    
+   // Skip low FFT bins so DC and low-frequency noise do not dominate the first EQ band
    size_t start_offset = FFT_SKIP_LOW_BINS;
 
    // Fallback when skip exceeds available bins 
@@ -121,39 +156,36 @@ esp_err_t audio_dsp_get_band_peak_frequency(
 
    for (size_t band = 0; band < num_bands; band++)
    {
-      // Log-spaced edge match 
-      const float min_bin_index_f = 1.0f;
-      const float max_bin_index_f = (float)mapped_bins_count;
-      const float log_min = logf(min_bin_index_f);
-      const float log_max = logf(max_bin_index_f);
+      size_t start = 0U;
+      size_t end = 0U;
 
-      const float t0 = (float)band / (float)num_bands;
-      const float t1 = (float)(band + 1U) / (float)num_bands;
+      // Use the same logarithmic band boundaries as the spectrum mapper
+      status = spectrum_map_get_band_range(
+         mapped_bins_count,
+         num_bands,
+         band,
+         &start,
+         &end
+      );
 
-      size_t start = (size_t)floorf(expf(log_min + t0 * (log_max - log_min)));
-      size_t end = (size_t)floorf(expf(log_min + t1 * (log_max - log_min)));
+      if (status != ESP_OK) return status;
 
-      // Catch bin state edge cases
-      if (start >= mapped_bins_count) start = mapped_bins_count - 1U;
-      if (end > mapped_bins_count) end = mapped_bins_count;
-      if (end <= start) end = start + 1U;
-      if (end > mapped_bins_count) end = mapped_bins_count;
+      size_t local_peak_idx = 0U;
+      float local_peak_mag = 0.0f;
 
-      size_t local_peak_idx = start;
-      float local_peak_mag = mapped_bins[start];
+      // Find the strongest FFT bin within the current frequency band
+      find_peak_bin(
+         mapped_bins,
+         start,
+         end,
+         &local_peak_idx,
+         &local_peak_mag
+      );
 
-      for (size_t i = start + 1U; i < end; i++)
-      {
-         if (mapped_bins[i] > local_peak_mag)
-         {
-            local_peak_mag = mapped_bins[i];
-            local_peak_idx = i;
-         }
-      }
       size_t global_bin = local_peak_idx + start_offset;
-      const float hz_per_bin = AUDIO_SAMPLE_RATE_HZ / (float)FFT_FRAME_SIZE;
 
-      band_peak_hz_out[band] = (float)global_bin * hz_per_bin;
+      // Convert the strongest FFT bin into its physical frequency
+      band_peak_hz_out[band] = fft_bin_to_hz(global_bin);
       band_peak_mag_out[band] = local_peak_mag;
 
       // Save to static module scope variables

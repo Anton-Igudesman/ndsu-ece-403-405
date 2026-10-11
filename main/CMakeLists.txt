@@ -8,7 +8,7 @@ idf_component_register(
       "dsp/audio_dsp_pipeline.c" 
       "led/effects/led_effects.c"
       "led/effects/led_color_fade.c"
-      "led/led_matrix_renderer.c"
+      "led/effects/led_effect_transition.c"
       "led/led_cube_mapper.c"
       "led/led_cube_renderer.c"
       "led/led_controller.c"

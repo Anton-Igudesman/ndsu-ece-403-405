@@ -12,7 +12,6 @@
 #include "freertos/task.h"
 
 #include "dsp/audio_buffer.h"
-#include "dsp/dft_engine.h"
 #include "dsp/fft_engine.h"
 #include "dsp/spectrum_map.h"
 #include "led/led_cube_mapper.h"
@@ -115,39 +114,6 @@ static esp_err_t run_timed_transform(
    return ESP_OK;
 }
 
-static esp_err_t run_dft_test(
-   const int16_t *frame,
-   const float **mags_out,
-   size_t *bins_out
-)
-{
-   /*
-      1) Init DFT engine
-      2) Process a frame
-      3) Get magnitudes from bins
-   */
-
-   if (frame == NULL || mags_out == NULL || bins_out == NULL) return ESP_ERR_INVALID_ARG;
-
-   esp_err_t status = dft_engine_init();
-   app_log_error(LOG_TAG, "dft_engine_init", status); // Status of dft_ingine_init
-   if (status != ESP_OK) return status;
-
-   status = run_timed_transform(
-      "DFT",
-      dft_engine_process_frame,
-      frame
-   );
-   if (status != ESP_OK) return status;
-   
-   status = dft_engine_get_magnitudes(mags_out, bins_out);
-   app_log_error(LOG_TAG, "dft_engine_get_magnitudes", status);
-   if (status != ESP_OK) return status; 
-   if (*mags_out == NULL || *bins_out == 0) return ESP_ERR_INVALID_STATE;
-
-   return ESP_OK;
-}
-
 static esp_err_t run_fft_test(
    const int16_t *frame,
    const float **mags_out,
@@ -241,22 +207,6 @@ static esp_err_t test_spectrum_mapping(
       bands[0], bands[1], bands[2], bands[3],
       bands[4], bands[5], bands[6], bands[7]);
 
-   // Normalizing bands for mapping to LED values
-   float bands_norm[SPECTRUM_NUM_BANDS] = {0};
-
-   status = spectrum_map_normalize_bands(
-      bands, // in
-      SPECTRUM_NUM_BANDS,
-      bands_norm // out
-   );
-
-   app_log_error(LOG_TAG, "spectrum_map_normalize_bands", status);
-   if (status != ESP_OK) return status;
-
-   ESP_LOGI(LOG_TAG, "spectrum bands norm: [%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f]",
-      bands_norm[0], bands_norm[1], bands_norm[2], bands_norm[3],
-      bands_norm[4], bands_norm[5], bands_norm[6], bands_norm[7]);
-
    return ESP_OK;
 }
 
@@ -278,78 +228,6 @@ static void log_transform_test_result(
       (unsigned)bins,
       mag0,
       mag1);
-}
-
-static esp_err_t compare_dft_fft(
-   const float *dft_mags,
-   size_t dft_bins,
-   const float *fft_mags,
-   size_t fft_bins
-)
-{
-   if (dft_mags == NULL || fft_mags == NULL) return ESP_ERR_INVALID_ARG;
-   if (dft_bins == 0 || fft_bins == 0) return ESP_ERR_INVALID_ARG;
-
-   // Bin count check
-   if (dft_bins != fft_bins)
-   {
-      ESP_LOGE(
-         LOG_TAG,
-         "DFT/FFT bin count mismatch: DFT=%u FFT=%u",
-         (unsigned)dft_bins,
-         (unsigned)fft_bins
-      );
-
-      return ESP_FAIL;
-   }
-
-   float max_abs_diff = 0.0f;
-   size_t max_diff_bin = 0;
-
-   // Loop through bins and remember the WORST disagreement
-   for (size_t k = 0; k < dft_bins; k++)
-   {
-      float abs_diff = fabsf(dft_mags[k] - fft_mags[k]);
-
-      if (abs_diff > max_abs_diff)
-      {
-         max_abs_diff = abs_diff;
-         max_diff_bin = k;
-      }
-   }
-
-   float dft_value = dft_mags[max_diff_bin];
-   float fft_value = fft_mags[max_diff_bin];
-
-   float relative_error = 0.0f;
-   if (fabsf(dft_value) > 0.0f) relative_error = max_abs_diff / fabsf(dft_value);
-
-   // Fail validation if DFT/FFT differ by more than 0.1%
-   const float max_relative_error = 0.001f;
-
-   if (relative_error > max_relative_error)
-   {
-      ESP_LOGE(
-         LOG_TAG,
-         "DFT/FFT validation FAILED: relative error %.6f%% exceeds %.3f%%",
-         relative_error * 100.0f,
-         max_relative_error * 100.0f
-      );
-
-      return ESP_FAIL;
-   }
-
-   ESP_LOGI(
-      LOG_TAG,
-      "DFT/FFT comparison: bin=%u DFT=%.3f FFT=%.3f abs_diff=%.3f relative_error=%.6f%%",
-      (unsigned)max_diff_bin,
-      dft_value,
-      fft_value,
-      max_abs_diff,
-      relative_error * 100.0f
-   );
-
-   return ESP_OK;
 }
 
 static esp_err_t validate_expected_peaks(
@@ -496,29 +374,9 @@ static esp_err_t audio_buffer_self_test(void)
    );
    if (status != ESP_OK) return status;
 
-   size_t dft_bins = 0;
-   const float *dft_mags = NULL;
-
    // -------------------------------
-   // ---- DFT/FFT validation ----
+   // ------ FFT validation ---------
    // -------------------------------
-
-   status = run_dft_test(
-      frame,
-      &dft_mags,
-      &dft_bins
-   );
-   if (status != ESP_OK) return status;
-   log_transform_test_result("DFT", dft_mags, dft_bins);
-
-   status = validate_expected_peaks(
-      "DFT",
-      dft_mags,
-      dft_bins,
-      expected_bins,
-      expected_bin_count
-   );
-   if (status != ESP_OK) return status;
 
    size_t fft_bins = 0;
    const float *fft_mags = NULL;
@@ -540,18 +398,9 @@ static esp_err_t audio_buffer_self_test(void)
    );
    if (status != ESP_OK) return status;
 
-   status = compare_dft_fft(
-      dft_mags,
-      dft_bins,
+   status = test_spectrum_mapping(
       fft_mags,
       fft_bins
-   );
-
-   if (status != ESP_OK) return status;
-
-   status = test_spectrum_mapping(
-      dft_mags,
-      dft_bins
    );
    if (status != ESP_OK) return status;
    
@@ -692,8 +541,8 @@ esp_err_t self_test_run_all(void)
    esp_err_t status = led_cube_mapper_self_test();
    if (status!= ESP_OK) return status;
 
-   // status = audio_buffer_self_test();
-   // if (status != ESP_OK) return status;
+   status = audio_buffer_self_test();
+   if (status != ESP_OK) return status;
 
    return ESP_OK;
 }
