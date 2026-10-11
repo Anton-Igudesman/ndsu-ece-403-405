@@ -32,6 +32,10 @@ FFT-based spectrum analysis for real-time LED visualization.
 
 ## Hardware
 
+### Pinout
+
+![ESP32-S3 Pinout](esp32_pinout.png)
+
 ### Controller
 
 - ESP32-S3-WROOM
