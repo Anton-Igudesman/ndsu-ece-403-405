@@ -56,7 +56,10 @@ esp_err_t led_effects_set_solid_color(
    uint8_t blue
 );
 
+esp_err_t led_effects_set_blink_color(led_cube_color_t color);
+esp_err_t led_effects_blink_step(void);
 esp_err_t led_effects_fade_step(void);
+
 esp_err_t led_effects_breathe_step(
    led_color_t color,
    uint8_t min_value,

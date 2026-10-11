@@ -3,6 +3,8 @@
 #include "led_effects.h"
 #include "led_color_fade.h"
 
+#define LED_EFFECT_BLINK_UPDATES 50U
+
 // State machine for programmed color fade patterns
 typedef enum
 {
@@ -29,9 +31,22 @@ typedef struct
    fade_phase_t phase; // while pattern
 } fade_state_t;
 
+// -------------------------------------
 // ----- Module Scope Definitions ------
+// -------------------------------------
+
 static fade_state_t s_led_state;
 static led_color_t s_last_breathe_color = LED_COLOR_RED;
+static bool s_blink_on = false;
+static uint32_t s_blink_update_count = 0U;
+
+// Blink will be default red and user-configurable
+static led_cube_color_t s_blink_color =
+{
+   .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+   .green = 0U,
+   .blue = 0U
+};
 
 // Color transition state used by full-cube fade effect
 static led_color_fade_t s_fade;
@@ -71,6 +86,13 @@ static esp_err_t led_effects_fade_init(void)
    s_current_fade_phase = FADE_RED_TO_PURPLE;
    s_fade_initialized = true;
 
+   return ESP_OK;
+}
+
+// Update the color used by blink effect
+esp_err_t led_effects_set_blink_color(led_cube_color_t color)
+{
+   s_blink_color = color;
    return ESP_OK;
 }
 
@@ -225,6 +247,35 @@ esp_err_t led_effects_fade_step(void)
       s_fade.current_color.red,
       s_fade.current_color.green,
       s_fade.current_color.blue
+   );
+}
+
+// Toggle full cube between on and off states
+esp_err_t led_effects_blink_step(void)
+{
+   // Count LED task updates to control the blink interval
+   s_blink_update_count++;
+
+   // Hold the current state until the blink interval expires
+   if (s_blink_update_count >= LED_EFFECT_BLINK_UPDATES)
+   {
+      s_blink_on = !s_blink_on;
+      s_blink_update_count = 0U;
+   }
+
+   if (s_blink_on)
+   {
+      return led_effects_set_solid_color(
+         s_blink_color.red,
+         s_blink_color.green,
+         s_blink_color.blue
+      );
+   }
+
+   return led_effects_set_solid_color(
+      0U,
+      0U,
+      0U
    );
 }
 

@@ -136,8 +136,14 @@ esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
          return led_effect_pockets_step();
 
       case LED_MODE_BLINK:
+         return led_effects_blink_step();
+
       case LED_MODE_OFF:
-         return ESP_OK;
+         return led_effects_set_solid_color(
+            0U,
+            0U,
+            0U
+         );
 
       default:
          return ESP_ERR_INVALID_STATE;
