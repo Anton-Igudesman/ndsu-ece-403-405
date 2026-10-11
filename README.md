@@ -211,9 +211,6 @@ Invalid credentials return:
 
     401 Unauthorized
 
-The current `admin` / `admin` credentials are temporary development
-credentials.
-
 ### Connected Clients
 
     GET /api/admin/clients
