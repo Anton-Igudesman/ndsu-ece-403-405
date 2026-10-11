@@ -160,16 +160,39 @@ static void init_color_values(led_color_t color)
    }
 }
 
-static void led_effects_initial_state(led_color_t color)
-{
-   // Setting initial parameters for LED stae
-   s_led_state = (fade_state_t){0};
-   s_led_state.step = 1;
-   init_color_values(color);
-}
 // ---------------------------------------
 // ----- Public Function Definitions -----
 // ---------------------------------------
+
+// Fill the entire cube with a single RGB color
+esp_err_t led_effects_set_solid_color(
+   uint8_t red,
+   uint8_t green,
+   uint8_t blue
+)
+{
+   for (size_t x = 0; x < LED_CUBE_SIZE; x++)
+   {
+      for (size_t y = 0; y < LED_CUBE_SIZE; y++)
+      {
+         for (size_t z = 0; z < LED_CUBE_SIZE; z++)
+         {
+            esp_err_t status = led_cube_set_voxel(
+               x,
+               y,
+               z,
+               red,
+               green,
+               blue
+            );
+
+            if (status != ESP_OK) return status;
+         }
+      }
+   }
+
+   return led_cube_show();
+}
 
 esp_err_t led_effects_fade_step(void)
 {

@@ -1,49 +1,56 @@
 #include "led_cube.h"
+#include "led_cube_rmt.h"
 
 #include <stdbool.h>
+#include <string.h>
 
-// One independent WS2812 strip handle for each physical Z layer (one PCB worth)
-static led_strip_handle_t s_layer_strips[LED_CUBE_SIZE] = {0};
+// Store RGB state for all 64 LEDs on each of the eight cube layers
+static led_cube_color_t s_layer_buffer
+   [LED_CUBE_SIZE]
+   [LED_CUBE_LAYER_PIXELS] = {0};
 
 static bool s_initialized = false;
 
-esp_err_t led_cube_init(
-   const led_strip_handle_t *layer_strips,
-   size_t layer_count
-)
+// ----------------------------------------
+// ----- Private Function Definitions -----
+// ----------------------------------------
+
+// Clear RGB state for all pixels across all eight cube layers
+static void clear_layer_buffer(void)
 {
-   if (layer_strips == NULL ||
-      layer_count != LED_CUBE_SIZE) return ESP_ERR_INVALID_ARG;
-
-   // Validate and store one strip handle for each physical PCB layer
-   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
-   {
-      if (layer_strips[layer] == NULL) return ESP_ERR_INVALID_ARG;
-      s_layer_strips[layer] = layer_strips[layer];
-   }
-
-   s_initialized = true;
-   return ESP_OK;
+   memset(
+      s_layer_buffer,
+      0,
+      sizeof(s_layer_buffer)
+   );
 }
+
+// ----------------------------------------
+// ------ Public Function Definitions -----
+// ----------------------------------------
 
 esp_err_t led_cube_clear(void)
 {
    if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
-   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   // Clear RGB state
+   clear_layer_buffer();
+   
+   return ESP_OK;
+}
+
+esp_err_t led_cube_init(void)
+{
+   s_initialized = true;
+
+   // Initialize cube with all stored pixel states off
+   esp_err_t status = led_cube_clear();
+   if (status != ESP_OK)
    {
-      for (size_t pixel_index = 0; pixel_index < LED_CUBE_LAYER_PIXELS; pixel_index++)
-      {
-         esp_err_t status = led_strip_set_pixel(
-            s_layer_strips[layer],
-            pixel_index,
-            0,
-            0,
-            0   
-         );
-         if (status != ESP_OK) return status;
-      }
+      s_initialized = false;
+      return status;
    }
+
    return ESP_OK;
 }
 
@@ -65,25 +72,24 @@ esp_err_t led_cube_set_voxel(
    esp_err_t status = led_cube_map_voxel(x, y, z, &layer, &pixel_index);
    if (status != ESP_OK) return status;
 
-   // Set the mapped pixel on the physical PCB selected by Z
-   return led_strip_set_pixel(
-      s_layer_strips[layer],
-      pixel_index,
-      red,
-      green,
-      blue
-   );
+   // Store voxel color in mapped layer and physical pixel position
+   s_layer_buffer[layer][pixel_index] = (led_cube_color_t)
+   {
+      .red = red,
+      .green = green,
+      .blue = blue
+   };
+
+   return ESP_OK;
 }
 
+/*
+   Display the current logical cube state through the physical RMT driver.
+   RMT channel management and WS2812 transmission remain hidden from callers.
+*/
 esp_err_t led_cube_show(void)
 {
    if (!s_initialized) return ESP_ERR_INVALID_STATE;
 
-   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
-   {
-      esp_err_t status = led_strip_refresh(s_layer_strips[layer]);
-      if (status != ESP_OK) return status;
-   }
-
-   return ESP_OK;
+   return led_cube_rmt_show(s_layer_buffer);
 }

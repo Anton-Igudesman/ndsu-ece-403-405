@@ -8,11 +8,11 @@
 
 #include "esp_err.h"
 #include "esp_log.h"
-#include "led_strip.h"
 
 // Custom headers
 #include "led/led_protocol.h"
 #include "led/led_cube.h"
+#include "led/led_cube_rmt.h"
 #include "led/led_controller.h"
 #include "led/led_cube_renderer.h"
 #include "ble/ble_telemetry.h"
@@ -22,13 +22,17 @@
 #include "test/self_test.h"
 #include "test/gpio4_scope_test.h"
 #include "common/app_log.h"
+#include "common/app_system.h"
+#include "wifi_ap.h"
+#include "web_server.h"
 
 _Static_assert(AUDIO_FRAME_SIZE == 1024, "Unexpected AUDIO_FRAME_SIZE");
 _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 "AUDIO_FRAME_SIZE must equal FFT_FRAME_SIZE");
 
-#define DSP_SELF_TEST_MODE 1
-#define DSP_DEBUG_LOGS 1
+#define DSP_SELF_TEST_MODE 0
+#define WEB_START_ON_BOOT 1
+#define DSP_DEBUG_LOGS 0
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
@@ -60,7 +64,6 @@ static const gpio_num_t s_cube_layer_gpios[LED_CUBE_SIZE] =
 };
 
 static const char *LOG_TAG = "rtos_ble_led";
-static led_strip_handle_t s_cube_layer_strips[LED_CUBE_SIZE] = {0};
 static i2s_chan_handle_t s_i2s_rx_chan = NULL;
 static uint32_t s_fft_frame_counter = 0; // Frame counter for rate-limited logs
 
@@ -276,41 +279,19 @@ static void audio_log_dsp_debug(const float *bands_norm)
 
 static esp_err_t led_cube_hardware_init(void)
 {
-   // Shared RMT configuration used by all eight cube data channels
-   led_strip_rmt_config_t rmt_config = 
-   {
-      .clk_src = RMT_CLK_SRC_DEFAULT,
-      .resolution_hz = 10 * 1000 * 1000,
-      .mem_block_symbols = 64,
-      .flags = {.with_dma = false}
-   };
+   // Initialize logical cube state
+   esp_err_t status = led_cube_init();
+   if (status != ESP_OK) return status;
 
-   // Create one independent WS2812 strip handle for each physical Z layer
-   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
-   {
-      led_strip_config_t strip_config = 
-      {
-         .strip_gpio_num = s_cube_layer_gpios[layer],
-         .max_leds = LED_CUBE_LAYER_PIXELS,
-         .led_model = LED_MODEL_WS2812,
-         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-         .flags = {.invert_out = false}
-      };
-
-      esp_err_t status = led_strip_new_rmt_device(
-         &strip_config,
-         &rmt_config,
-         &s_cube_layer_strips[layer]
-      );
-
-      if (status != ESP_OK) return status;
-   }
-
-   // Pass completed physical layer array into logical cube abstraction
-   return led_cube_init(
-      s_cube_layer_strips,
+   // Initialize four-channel RMT driver for the eight physical layer GPIOs
+   status = led_cube_rmt_init(
+      s_cube_layer_gpios,
       LED_CUBE_SIZE
    );
+
+   if (status != ESP_OK) return status;
+
+   return ESP_OK;
 }
 
 // Extract targeted stats for BLE advertisement
@@ -436,8 +417,22 @@ void app_main(void)
    return;
    #endif
 
+   // Initialize shared non-volatile storage used by system services
+   esp_err_t status = app_system_init_nvs();
+
+   if (status != ESP_OK)
+   {
+      ESP_LOGE(
+         LOG_TAG,
+         "app_system_init_nvs failed: %s",
+         esp_err_to_name(status)
+      );
+
+      return;
+   }
+
    // Initialize eight physical LED layers and logical cube interface
-   esp_err_t status = led_cube_hardware_init();
+   status = led_cube_hardware_init();
 
    if (status != ESP_OK)
    {
@@ -460,6 +455,45 @@ void app_main(void)
       );
       return;
    }
+
+   // Initialize WiFi AP subsystem
+   status = wifi_ap_init();
+   if (status != ESP_OK)
+   {
+      ESP_LOGE(
+         LOG_TAG,
+         "wifi_ap_init faild %s:",
+         esp_err_to_name(status)
+      );
+      return;
+   }
+
+   #if WEB_START_ON_BOOT
+
+      // Dev mode: start web network at boot
+      status = wifi_ap_start();
+      if (status != ESP_OK)
+      {
+         ESP_LOGE(
+            LOG_TAG,
+            "wifi_ap_start failed %s",
+            esp_err_to_name(status)
+         );
+         return;
+      }
+
+      // Start HTTP server after WiFi AP is available
+      status = web_server_start();
+      if (status != ESP_OK)
+      {
+         ESP_LOGE(
+            LOG_TAG,
+            "web_server_start failed: %s",
+            esp_err_to_name(status)
+         );
+         return;
+      }
+   #endif
 
    status = mic_i2s_init();
    app_log_error(LOG_TAG, "mic_i2s_init", status);

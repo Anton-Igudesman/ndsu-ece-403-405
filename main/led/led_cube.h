@@ -4,7 +4,6 @@
 #include <stdint.h>
 
 #include "esp_err.h"
-#include "led_strip.h"
 #include "led_cube_mapper.h"
 
 /*
@@ -28,10 +27,7 @@
    layer_strips[7] corresponds to z=7 (top PCB).
 */
 
-esp_err_t led_cube_init(
-   const led_strip_handle_t *layer_strips,
-   size_t layer_count
-);
+esp_err_t led_cube_init(void);
 
 /*
    Set the color of one logical voxel in the cube

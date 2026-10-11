@@ -13,11 +13,15 @@ idf_component_register(
       "led/led_cube_renderer.c"
       "led/led_controller.c"
       "led/led_cube.c"
+      "led/led_cube_rmt.c"
       "led/effects/led_effect_pockets.c"
       "test/self_test.c" 
       "test/gpio4_scope_test.c"
       "common/app_log.c"
       "common/random_utils.c"
+      "common/app_system.c"
+      "web/backend/wifi_ap.c"
+      "web/backend/web_server.c"
    INCLUDE_DIRS 
       "."
       "app"
@@ -27,5 +31,17 @@ idf_component_register(
       "test"
       "common"
       "led/effects"
+      "web/backend"
+   EMBED_FILES
+      "web/frontend/dist/index.html"
+      "web/frontend/dist/assets/app.js"
+      "web/frontend/dist/assets/app.css"
    REQUIRES led_strip
-   PRIV_REQUIRES esp_driver_gpio esp_driver_i2s bt nvs_flash)
+   PRIV_REQUIRES 
+      esp_driver_gpio 
+      esp_driver_i2s 
+      bt 
+      nvs_flash
+      esp_http_server
+      json
+   )

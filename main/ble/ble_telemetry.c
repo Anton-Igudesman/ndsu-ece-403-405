@@ -3,7 +3,6 @@
 #include "ble_telemetry.h"
 
 #include "esp_log.h"
-#include "nvs_flash.h"
 
 #include "dsp/spectrum_map.h"
 #include "freertos/FreeRTOS.h"
@@ -17,7 +16,6 @@
 
 // frame_id, peak_bin, peak_hz_q (hi/lo), spectrum_bands = 12
 #define BLE_TELEMETRY_ADV_PAYLOAD_LEN (4U + SPECTRUM_NUM_BANDS)
-#define BLE_REFRESH_DIVISOR 8U
 
 // -----------------------------------------
 // -------- Function Prototypes ------------
@@ -84,39 +82,6 @@ esp_err_t ble_telemetry_update_snapshot(
    }
 
    s_snapshot_valid = true;
-
-   // Verify data before BLE adv packing
-   ESP_LOGI(
-      LOG_TAG,
-      "snapshot frame=%u peak_bin=%u peak_hz_q=%u bands=[%u, %u, %u, %u, %u, %u, %u, %u]",
-      (unsigned)s_latest_snapshot.frame_id,
-      (unsigned)s_latest_snapshot.peak_bin,
-      (unsigned)s_latest_snapshot.peak_hz_q,
-      (unsigned)s_latest_snapshot.band_level_q[0],
-      (unsigned)s_latest_snapshot.band_level_q[1],
-      (unsigned)s_latest_snapshot.band_level_q[2],
-      (unsigned)s_latest_snapshot.band_level_q[3],
-      (unsigned)s_latest_snapshot.band_level_q[4],
-      (unsigned)s_latest_snapshot.band_level_q[5],
-      (unsigned)s_latest_snapshot.band_level_q[6],
-      (unsigned)s_latest_snapshot.band_level_q[7]
-   );
-
-   // NimBLE advertisement throttle 
-   if ((s_latest_snapshot.frame_id % BLE_REFRESH_DIVISOR) != 0U) return ESP_OK;
-
-   // Refresh advertising so scanner can read newest telemetry bytes
-   // Ignore "not active" stop result
-
-   // Ask GAP layer to stop current advertising procedure
-   int stop_status_code = ble_gap_adv_stop(); // Store new result
-   if (stop_status_code != 0 && stop_status_code != BLE_HS_EALREADY)
-   {
-      ESP_LOGW(LOG_TAG, "ble_gap_adv_stop returned status_code=%d", stop_status_code);
-   }
-
-   // Rebuild advertisement + scan response from current module state
-   ble_start_advertising();
 
    return ESP_OK;
 }
@@ -245,25 +210,6 @@ static void ble_host_task(void *param)
    vTaskDelete(NULL);
 }
 
-static esp_err_t ble_nvs_init(void)
-{
-   // Initialize nvs flash
-   esp_err_t status = nvs_flash_init();
-
-   if (status == ESP_ERR_NVS_NO_FREE_PAGES ||
-      status == ESP_ERR_NVS_NEW_VERSION_FOUND)
-   {
-      status = nvs_flash_erase();
-      if (status != ESP_OK) return status;
-
-      status = nvs_flash_init();
-      if (status != ESP_OK) return status;
-   }
-
-   else if (status != ESP_OK) return status;
-   return ESP_OK;
-}
-
 static void nimble_host_config_init(void)
 {
    // Set host callbacks
@@ -274,12 +220,8 @@ static void nimble_host_config_init(void)
 
 esp_err_t ble_telemetry_init(void)
 {
-   // NVS flash
-   esp_err_t status = ble_nvs_init();
-   if (status != ESP_OK) return status;
-
    // NimBLE host stack init
-   status = nimble_port_init();
+   esp_err_t status = nimble_port_init();
    if (status != ESP_OK) return status;
 
    // Initialize GAP service
@@ -306,6 +248,9 @@ esp_err_t ble_telemetry_start(void)
       5,                // High priority app task
       NULL
    );
+
+   // Do not mark BLE started if the host task could not be created
+   if (create_status != pdPASS) return ESP_FAIL;
 
    // Guard against duplicate host task creation 
    s_ble_started = true;
