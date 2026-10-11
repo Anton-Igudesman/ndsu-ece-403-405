@@ -197,8 +197,8 @@ other clients on the LED-Cube network.
 Request:
 
     {
-      "username": "admin",
-      "password": "admin"
+      "username": <uname>,
+      "password": <password>
     }
 
 Successful response:
