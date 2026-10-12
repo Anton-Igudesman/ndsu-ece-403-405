@@ -402,3 +402,107 @@ esp_err_t led_cube_rmt_show(
 
    return wait_for_batch_complete();
 }
+
+esp_err_t led_cube_rmt_test_pixel(size_t pixel_index)
+{
+   if (!s_initialized) return ESP_ERR_INVALID_STATE;
+   if (pixel_index >= LED_CUBE_LAYER_PIXELS) return ESP_ERR_INVALID_ARG;
+
+   // Raw GRB data for one 64-pixel WS2812 matrix
+   uint8_t test_buffer[LED_CUBE_LAYER_PIXELS * 3U] = {0};
+
+   // WS2812 byte order is GRB
+   size_t byte_index = pixel_index * 3U;
+
+   test_buffer[byte_index] = 32U;       // Green
+   test_buffer[byte_index + 1U] = 0U;  // Red
+   test_buffer[byte_index + 2U] = 0U;  // Blue
+
+   // Make sure channel 0 is physically connected to layer 0 / GPIO7
+   esp_err_t status = disable_tx_channel(0U);
+   if (status != ESP_OK) return status;
+
+   status = switch_tx_channel_gpio(
+      0U,
+      0U
+   );
+
+   if (status != ESP_OK) return status;
+
+   status = enable_tx_channel(0U);
+   if (status != ESP_OK) return status;
+
+   rmt_transmit_config_t transmit_config =
+   {
+      .loop_count = 0
+   };
+
+   status = rmt_transmit(
+      s_tx_channels[0],
+      s_ws2812_encoder,
+      test_buffer,
+      sizeof(test_buffer),
+      &transmit_config
+   );
+
+   if (status != ESP_OK) return status;
+
+   return rmt_tx_wait_all_done(
+      s_tx_channels[0],
+      -1
+   );
+}
+
+esp_err_t led_cube_rmt_test_matrix(
+   const led_cube_color_t *pixels
+)
+{
+   if (!s_initialized) return ESP_ERR_INVALID_STATE;
+   if (pixels == NULL) return ESP_ERR_INVALID_ARG;
+
+   uint8_t test_buffer[LED_CUBE_LAYER_PIXELS * 3U] = {0};
+
+   // Convert RGB pixel data to WS2812 GRB byte order
+   for (size_t pixel = 0; pixel < LED_CUBE_LAYER_PIXELS; pixel++)
+   {
+      size_t byte_index = pixel * 3U;
+
+      test_buffer[byte_index] = pixels[pixel].green;
+      test_buffer[byte_index + 1U] = pixels[pixel].red;
+      test_buffer[byte_index + 2U] = pixels[pixel].blue;
+   }
+
+   // Force RMT channel 0 onto layer 0 / GPIO7
+   esp_err_t status = disable_tx_channel(0U);
+   if (status != ESP_OK) return status;
+
+   status = switch_tx_channel_gpio(
+      0U,
+      0U
+   );
+
+   if (status != ESP_OK) return status;
+
+   status = enable_tx_channel(0U);
+   if (status != ESP_OK) return status;
+
+   rmt_transmit_config_t transmit_config =
+   {
+      .loop_count = 0
+   };
+
+   status = rmt_transmit(
+      s_tx_channels[0],
+      s_ws2812_encoder,
+      test_buffer,
+      sizeof(test_buffer),
+      &transmit_config
+   );
+
+   if (status != ESP_OK) return status;
+
+   return rmt_tx_wait_all_done(
+      s_tx_channels[0],
+      -1
+   );
+}

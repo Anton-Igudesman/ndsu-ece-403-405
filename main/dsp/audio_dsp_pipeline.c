@@ -23,6 +23,13 @@ static float s_last_band_peak_mag[SPECTRUM_NUM_BANDS] = {0};
 static bool s_last_band_peaks_valid = false;
 static uint32_t s_trace_frame_counter = 0;
 
+// Per-band microphone noise floor measured during startup calibration
+static float s_noise_floor[SPECTRUM_NUM_BANDS] = {0};
+static bool s_noise_floor_calibrated = false;
+static size_t s_calibration_frame_count = 0;
+
+#define DSP_CALIBRATION_FRAMES 30U
+
 // Find the strongest FFT bin within the specified interval [start, end)
 static void find_peak_bin(
    const float *bins,
@@ -248,6 +255,51 @@ static esp_err_t map_fft_bins_to_bands(
    );
 }
 
+// Measure the quiet noise floor independently for each frequency band
+static bool calibrate_noise_floor(
+   const float *bands,
+   size_t num_bands
+)
+{
+   if (bands == NULL || num_bands == 0) return false;
+
+   if (num_bands > SPECTRUM_NUM_BANDS) num_bands = SPECTRUM_NUM_BANDS;
+
+   // Accumulate raw band magnitudes while the microphone is quiet
+   for (size_t i = 0; i < num_bands; i++) s_noise_floor[i] += bands[i];
+
+   s_calibration_frame_count++;
+
+   ESP_LOGI(
+      LOG_TAG,
+      "calibrating noise floor... frame=%u/%u",
+      (unsigned)s_calibration_frame_count,
+      (unsigned)DSP_CALIBRATION_FRAMES
+   );
+
+   if (s_calibration_frame_count < DSP_CALIBRATION_FRAMES) return false;
+
+   // Convert accumulated magnitudes into an average noise floor per band
+   for (size_t i = 0; i < num_bands; i++) s_noise_floor[i] /= (float)DSP_CALIBRATION_FRAMES;
+
+   s_noise_floor_calibrated = true;
+
+   ESP_LOGI(
+      LOG_TAG,
+      "noise calibration complete: [%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f]",
+      s_noise_floor[0],
+      s_noise_floor[1],
+      s_noise_floor[2],
+      s_noise_floor[3],
+      s_noise_floor[4],
+      s_noise_floor[5],
+      s_noise_floor[6],
+      s_noise_floor[7]
+   );
+
+   return true;
+}
+
 // Apply soft gate and fixed floor suppression to raw bands in-place
 static void apply_soft_gate_and_floor(
    float *bands,
@@ -282,13 +334,13 @@ static void apply_soft_gate_and_floor(
    for (size_t i = 0; i < num_bands; i++) bands[i] *= gate_gain;
 
    /*
-      Subtract floor to suppress broadband noise haze
-      band = max(0, band - noise_floor)
+   Subtract the calibrated noise floor independently for each band:
+   band[i] = max(0, band[i] - noise_floor[i])
    */
-   const float noise_floor = 110.0f;
    for (size_t i = 0; i < num_bands; i++)
    {
-      bands[i] = bands[i] - noise_floor;
+      bands[i] = bands[i] - s_noise_floor[i];
+
       if (bands[i] < 0.0f) bands[i] = 0.0f;
    }
 
@@ -307,17 +359,27 @@ static void smooth_raw_bands(float *bands, size_t num_bands)
    // Persistent per-band state across frames
    static bool s_raw_smooth_initialized = false;
    static float s_raw_bands_smooth[SPECTRUM_NUM_BANDS] = {0};
-   const float raw_smoothing_alpha = 0.12f;
+   
+   const float attack_alpha = 0.80f;
+   const float release_alpha = 0.30f;
 
    /*
-      EMA:
+      Exponential Moving Average (EMA):
       y[n] = y[n-1] + alpha * (x[n] - y[n-1])
+
+      Larger alpha follows the current input more quickly.
+      Smaller alpha retains more of the previous value.
    */
    for (size_t i = 0; i < num_bands; i++)
    {
       float current = bands[i];
       float prev = s_raw_smooth_initialized ? s_raw_bands_smooth[i] : current;
-      float smooth = prev + raw_smoothing_alpha * (current - prev);
+
+      // Attack/release EMA:
+      // A rising signal uses a large alpha for a rapid response.
+      // A falling signal uses a smaller alpha for a smooth visual decay.
+      float alpha = (current > prev) ? attack_alpha : release_alpha;
+      float smooth = prev + alpha * (current - prev);
 
       s_raw_bands_smooth[i] = smooth;
       bands[i] = smooth;
@@ -442,18 +504,28 @@ static esp_err_t map_condition_normalize_bands(
    esp_err_t status = map_fft_bins_to_bands(mags, bins, bands);
    if (status != ESP_OK) return status;
 
-   for (size_t band_index = 0; band_index < SPECTRUM_NUM_BANDS; band_index++)
-   {
+   for (size_t band_index = 0; band_index < SPECTRUM_NUM_BANDS; band_index++) 
       bands_mapped[band_index] = bands[band_index];
+
+   // Calibrate the actual quiet FFT magnitude of each frequency band at startup
+   if (!s_noise_floor_calibrated)
+   {
+      (void)calibrate_noise_floor(
+         bands,
+         SPECTRUM_NUM_BANDS
+      );
+
+      // Keep output silent while calibration is running
+      for (size_t i = 0; i < SPECTRUM_NUM_BANDS; i++) bands_norm_out[i] = 0.0f;
+
+      return ESP_OK;
    }
 
    apply_soft_gate_and_floor(bands, SPECTRUM_NUM_BANDS, &gate_gain, &max_raw);
    smooth_raw_bands(bands, SPECTRUM_NUM_BANDS);
 
    for (size_t band_index = 0; band_index < SPECTRUM_NUM_BANDS; band_index++)
-   {
       bands_conditioned[band_index] = bands[band_index];
-   }
 
    normalize_bands_running_max(
       bands,

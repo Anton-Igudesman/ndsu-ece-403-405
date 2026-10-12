@@ -20,4 +20,10 @@ esp_err_t led_cube_rmt_show(
       [LED_CUBE_LAYER_PIXELS]
 );
 
+esp_err_t led_cube_rmt_test_pixel(size_t pixel_index);
+
+esp_err_t led_cube_rmt_test_matrix(
+   const led_cube_color_t *pixels
+);
+
 #endif

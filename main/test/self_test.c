@@ -415,14 +415,19 @@ static void mic_monitor_task(void *arg)
    size_t bytes_read = 0;
 
    // --- Calibration settings ---
+   const int settle_frames = 20;           // Discard fir ~2 seconds
    const int calibration_frames = 30;      // ~3 seconds at 100 ms loop
    const float alpha = 0.10f;              // EMA smoothing factor
    const float voice_ratio_threshold = 2.0f;
 
+   int settle_count = 0;
    int frame_count = 0;
+
    float baseline_acc = 0.0f;
    float baseline = 0.0f;
    float ema = 0.0f;
+   
+   bool ema_initialized = false;
    bool calibrated = false;
 
    ESP_LOGI(LOG_TAG, "mic_monitor: stay QUIET for calibration...");
@@ -469,8 +474,33 @@ static void mic_monitor_task(void *arg)
 
       float mean_abs = (float)mean_abs_acc / (float)sample_count;
 
-      // EMA smoothing for more stable level readout.
-      if (frame_count == 0) ema = mean_abs;
+      // Discard initial I2S/microphone startup frames before calibration
+      if (settle_count < settle_frames)
+      {
+         settle_count++;
+
+         ESP_LOGI(
+            LOG_TAG,
+            "settling... frame=%d/%d mean_abs=%.1f",
+            settle_count,
+            settle_frames,
+            mean_abs
+         );
+
+         vTaskDelay(pdMS_TO_TICKS(100));
+         continue;
+      }
+
+      // Initialize EMA only after startup settling is complete
+      if (!ema_initialized)
+      {
+         ema = mean_abs;
+         ema_initialized = true;
+      }
+
+      // Exponential Moving Average (EMA):
+      // new_ema = (1 - alpha) * previous_ema + alpha * current_measurement
+      // Smooths rapid changes by weighting the previous level more heavily than the current frame.
       else ema = (1.0f - alpha) * ema + alpha * mean_abs;
       
       if (!calibrated)

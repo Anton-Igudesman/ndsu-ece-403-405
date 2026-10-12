@@ -21,6 +21,7 @@
 #include "dsp/audio_dsp_pipeline.h"
 #include "test/self_test.h"
 #include "test/gpio4_scope_test.h"
+#include "test/led_matrix_test.h"
 #include "common/app_log.h"
 #include "common/app_system.h"
 #include "wifi_ap.h"
@@ -34,22 +35,39 @@ _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 #define WEB_START_ON_BOOT 1
 #define DSP_DEBUG_LOGS 0
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
+#define LED_MATRIX_TEST_MODE 1
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
 #define LED_AUDIO_QUEUE_LEN 1U // Queue consists of 1 processed audio frame
 #define LED_CMD_QUEUE_LEN 8
 
 // ---------------------------------
-// -- Pin assignment for DIN lines--
+// ---- LED layer data outputs -----
 // ---------------------------------
-#define CUBE_LAYER_0_GPIO GPIO_NUM_4
-#define CUBE_LAYER_1_GPIO GPIO_NUM_5
-#define CUBE_LAYER_2_GPIO GPIO_NUM_6
-#define CUBE_LAYER_3_GPIO GPIO_NUM_7
-#define CUBE_LAYER_4_GPIO GPIO_NUM_8
-#define CUBE_LAYER_5_GPIO GPIO_NUM_9
-#define CUBE_LAYER_6_GPIO GPIO_NUM_10
-#define CUBE_LAYER_7_GPIO GPIO_NUM_11
+#define CUBE_LAYER_0_GPIO GPIO_NUM_7
+#define CUBE_LAYER_1_GPIO GPIO_NUM_15
+#define CUBE_LAYER_2_GPIO GPIO_NUM_16
+#define CUBE_LAYER_3_GPIO GPIO_NUM_17
+#define CUBE_LAYER_4_GPIO GPIO_NUM_18
+#define CUBE_LAYER_5_GPIO GPIO_NUM_8
+#define CUBE_LAYER_6_GPIO GPIO_NUM_9
+#define CUBE_LAYER_7_GPIO GPIO_NUM_10
+
+// ---------------------------------
+// -- Pin assignment for I2S mic ---
+// ---------------------------------
+
+#define MIC_I2S_BCLK_GPIO GPIO_NUM_21
+#define MIC_I2S_WS_GPIO   GPIO_NUM_47
+#define MIC_I2S_DIN_GPIO  GPIO_NUM_2
+
+// ---------------------------------
+// -- Analog audio filter inputs ---
+// ---------------------------------
+
+#define AUDIO_LOW_ADC_GPIO  GPIO_NUM_4
+#define AUDIO_MID_ADC_GPIO  GPIO_NUM_5
+#define AUDIO_HIGH_ADC_GPIO GPIO_NUM_6
 
 static const gpio_num_t s_cube_layer_gpios[LED_CUBE_SIZE] =
 {
@@ -107,10 +125,10 @@ static esp_err_t mic_i2s_init(void)
       .gpio_cfg = 
       {
          .mclk = I2S_GPIO_UNUSED,
-         .bclk = GPIO_NUM_16,
-         .ws = GPIO_NUM_17,
+         .bclk = MIC_I2S_BCLK_GPIO,
+         .ws = MIC_I2S_WS_GPIO,
          .dout = I2S_GPIO_UNUSED,
-         .din = GPIO_NUM_18,
+         .din = MIC_I2S_DIN_GPIO,
          .invert_flags = 
          {
             .mclk_inv = false,
@@ -172,10 +190,22 @@ static void led_task(void *arg)
       // Non-blocking read of latest audio frame - keep last value if none available
       (void)xQueueReceive(s_led_audio_queue, &latest_audio, 0);
 
-      // Abstract away LED pattern algorithms
+      esp_err_t status;
+      #if LED_MATRIX_TEST_MODE
+
+      // Test hardware - render production DSP bands on single 8x8 matrix
+      //status = led_matrix_test_render_eq(latest_audio.bands_norm);
+      status = led_matrix_test_render_eq(latest_audio.bands_norm);
+      if (status != ESP_OK) log_effect_status("led_matrix_test_render_eq", status);
+
+      # else
+
+      // Abstract away LED pattern algorithms - production rendering
       esp_err_t status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
 
       if (status != ESP_OK) log_effect_status("led_controller_dispatch_active_mode", status);
+
+      # endif
 
       // Run LED mode updates every 10 ms
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -445,7 +475,7 @@ void app_main(void)
    }
 
    // Initialize LED controller with default startup mode
-   status = led_controller_init(LED_MODE_POCKETS);
+   status = led_controller_init(LED_MODE_AUDIO_EQ);
    if (status != ESP_OK)
    {
       ESP_LOGE(

@@ -17,6 +17,7 @@ idf_component_register(
       "led/effects/led_effect_pockets.c"
       "test/self_test.c" 
       "test/gpio4_scope_test.c"
+      "test/led_matrix_test.c"
       "common/app_log.c"
       "common/random_utils.c"
       "common/app_system.c"
