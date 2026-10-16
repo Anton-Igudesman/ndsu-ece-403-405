@@ -23,6 +23,7 @@ idf_component_register(
       "common/app_system.c"
       "web/backend/wifi_ap.c"
       "web/backend/web_server.c"
+      "web/backend/client_manager.c"
    INCLUDE_DIRS 
       "."
       "app"

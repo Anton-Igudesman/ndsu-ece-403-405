@@ -406,8 +406,8 @@ static void audio_fft_live_task(void *arg)
 
       #if DSP_DEBUG_LOGS 
       audio_log_dsp_debug(bands_norm);
-      #else 
-      if ((s_fft_frame_counter % 64U) == 0U) ESP_LOGI(LOG_TAG, "audio frame processed");
+      //#else 
+      //if ((s_fft_frame_counter % 64U) == 0U) ESP_LOGI(LOG_TAG, "audio frame processed");
       #endif
 
       // Always yield so IDLE task can run and feed watchdog

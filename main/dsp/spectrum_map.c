@@ -2,7 +2,7 @@
 #include <math.h>
 #include "esp_log.h"
 
-#define SPECTRUM_MAP_TRACE_LOGS 1
+#define SPECTRUM_MAP_TRACE_LOGS 0
 #define SPECTRUM_MAP_TRACE_DIVISOR 32U
 
 static const char *LOG_TAG = "spectrum_map";

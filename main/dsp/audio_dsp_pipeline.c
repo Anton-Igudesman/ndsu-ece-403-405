@@ -12,7 +12,7 @@
 // Reduce persistent low-band domincance that can flatten EQ shape
 // Possibly at the loss of bass detail below 10 * 46.875 Hz
 #define FFT_SKIP_LOW_BINS 10
-#define DSP_PIPELINE_TRACE_LOGS 1
+#define DSP_PIPELINE_TRACE_LOGS 0
 #define DSP_PIPELINE_TRACE_DIVISOR 32U
 
 static const char *LOG_TAG = "audio_dsp";
@@ -435,7 +435,7 @@ static void normalize_bands_running_max(
    if (running_max_out != NULL) *running_max_out = s_running_max;
    if (frame_max_out != NULL) *frame_max_out = frame_max;
 }
-
+#if DSP_PIPELINE_TRACE_LOGS
 static void trace_pipeline_math_once(
    size_t bins,
    const float *bands_mapped,
@@ -484,6 +484,7 @@ static void trace_pipeline_math_once(
       bands_norm[4], bands_norm[5], bands_norm[6], bands_norm[7]
    );
 }
+#endif
 
 // run FFT -> map -> condition -> smooth -> normalize
 static esp_err_t map_condition_normalize_bands(
@@ -494,8 +495,12 @@ static esp_err_t map_condition_normalize_bands(
    if (mags == NULL || bands_norm_out == NULL || bins == 0) return ESP_ERR_INVALID_ARG;
 
    float bands[SPECTRUM_NUM_BANDS] = {0};
+
+   #if DSP_PIPELINE_TRACE_LOGS
    float bands_mapped[SPECTRUM_NUM_BANDS] = {0};
    float bands_conditioned[SPECTRUM_NUM_BANDS] = {0};
+   #endif
+
    float gate_gain = 0.0f;
    float max_raw = 0.0f;
    float running_max = 0.0f;
@@ -504,8 +509,10 @@ static esp_err_t map_condition_normalize_bands(
    esp_err_t status = map_fft_bins_to_bands(mags, bins, bands);
    if (status != ESP_OK) return status;
 
+   #if DSP_PIPE_LINE_TRACE_LOGS
    for (size_t band_index = 0; band_index < SPECTRUM_NUM_BANDS; band_index++) 
       bands_mapped[band_index] = bands[band_index];
+   #endif
 
    // Calibrate the actual quiet FFT magnitude of each frequency band at startup
    if (!s_noise_floor_calibrated)
@@ -524,9 +531,11 @@ static esp_err_t map_condition_normalize_bands(
    apply_soft_gate_and_floor(bands, SPECTRUM_NUM_BANDS, &gate_gain, &max_raw);
    smooth_raw_bands(bands, SPECTRUM_NUM_BANDS);
 
+   #if DSP_PIPELINE_TRACE_LOGS
    for (size_t band_index = 0; band_index < SPECTRUM_NUM_BANDS; band_index++)
       bands_conditioned[band_index] = bands[band_index];
-
+   #endif
+   
    normalize_bands_running_max(
       bands,
       SPECTRUM_NUM_BANDS,
