@@ -31,13 +31,6 @@ static const char *LOG_TAG = "web_server";
 static httpd_handle_t s_server = NULL;
 static bool s_initialized = false;
 
-// MAC and DHCP-assigned IP information for one connected WiFi client
-typedef struct
-{
-   uint8_t mac[6];
-   esp_ip4_addr_t ip;
-} web_client_t;
-
 typedef struct
 {
    int socket_fd;
@@ -70,91 +63,148 @@ extern const uint8_t app_css_end[]
 // ---------------- Private Function Definitions -------------
 // -----------------------------------------------------------
 
-/*
-   Add an authenticated administrator WebSocket to the active registry.
-
-   If the same device reconnects, its existing entry is updated rather
-   than consuming another WebSocket slot.
-*/
-static esp_err_t register_admin_websocket(
-   int socket_fd,
-   const uint8_t mac[6]
+// Parse a MAC address string into six bytes
+static esp_err_t parse_mac_address(
+   const char *mac_string,
+   uint8_t mac[6]
 )
 {
-   if (socket_fd < 0 || mac == NULL)
+   if (mac_string == NULL || mac == NULL)
       return ESP_ERR_INVALID_ARG;
 
-   // Update the existing entry if this administrator reconnects.
-   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
-   {
-      if (memcmp(
-            s_admin_websockets[admin].mac,
-            mac,
-            sizeof(s_admin_websockets[admin].mac)
-         ) == 0)
-      {
-         s_admin_websockets[admin].socket_fd = socket_fd;
-         return ESP_OK;
-      }
-   }
+   unsigned int bytes[6];
+   int consumed = 0;
 
-   // Otherwise use the first available WebSocket slot.
-   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
-   {
-      if (s_admin_websockets[admin].socket_fd < 0)
-      {
-         s_admin_websockets[admin].socket_fd = socket_fd;
+   // Parse six hexadecimal bytes and record the number of characters consumed
+   int parsed = sscanf(
+      mac_string,
+      "%2x:%2x:%2x:%2x:%2x:%2x%n",
+      &bytes[0],
+      &bytes[1],
+      &bytes[2],
+      &bytes[3],
+      &bytes[4],
+      &bytes[5],
+      &consumed
+   );
 
-         memcpy(
-            s_admin_websockets[admin].mac,
-            mac,
-            sizeof(s_admin_websockets[admin].mac)
-         );
+   // Require all six bytes, exactly 17 characters, and no trailing data
+   if (parsed != 6 || consumed != 17 ||
+       mac_string[consumed] != '\0')
+      return ESP_ERR_INVALID_ARG;
 
-         return ESP_OK;
-      }
-   }
+   // Convert the parsed hexadecimal values into individual bytes
+   for (size_t index = 0; index < 6; index++)
+      mac[index] = (uint8_t)bytes[index];
 
-   return ESP_ERR_NO_MEM;
+   return ESP_OK;
 }
 
-/*
-   Remove an administrator WebSocket from the active registry.
-*/
-static void remove_admin_websocket(
-   int socket_fd
+// Process an administrator controller authorization action
+static esp_err_t process_admin_controller_action(const cJSON *root)
+{
+   if (root == NULL) return ESP_ERR_INVALID_ARG;
+
+   // Extract the requested action and target MAC address from the JSON message
+   const cJSON *action = cJSON_GetObjectItemCaseSensitive(
+      root,
+      "action"
+   );
+
+   const cJSON *mac_string = cJSON_GetObjectItemCaseSensitive(
+      root,
+      "mac"
+   );
+
+   // Both JSON fields must contain strings
+   if (!cJSON_IsString(action) || !cJSON_IsString(mac_string))
+      return ESP_ERR_INVALID_ARG;
+
+   uint8_t client_mac[6];
+
+   // Convert the MAC address string into six bytes
+   esp_err_t status = parse_mac_address(
+      mac_string->valuestring,
+      client_mac
+   );
+
+   if (status != ESP_OK) return status;
+
+   // strcmp() returns 0 when both strings match.
+   // Approve the pending client when the action is "approve_controller".
+   if (strcmp(action->valuestring, "approve_controller") == 0)
+      return client_manager_approve_controller(client_mac);
+
+   // Deny the pending client when the action is "deny_controller".
+   if (strcmp(action->valuestring, "deny_controller") == 0)
+      return client_manager_deny_controller(client_mac);
+
+   // Reject any action that the server does not recognize
+   return ESP_ERR_NOT_SUPPORTED;
+}
+
+// Send an authorization action result to the requesting administrator
+static esp_err_t send_admin_websocket_response(
+   int socket_fd,
+   esp_err_t action_status
 )
 {
-   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
+   if (s_server == NULL || socket_fd < 0)
+      return ESP_ERR_INVALID_STATE;
+
+   // Build a JSON response indicating whether the action succeeded
+   cJSON *response = cJSON_CreateObject();
+
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   cJSON_AddStringToObject(
+      response,
+      "event",
+      "controller_action_result"
+   );
+
+   cJSON_AddBoolToObject(
+      response,
+      "success",
+      action_status == ESP_OK
+   );
+
+   // Include the ESP-IDF error description when the action fails
+   if (action_status != ESP_OK)
    {
-      if (s_admin_websockets[admin].socket_fd == socket_fd)
-      {
-         s_admin_websockets[admin].socket_fd = -1;
-
-         memset(
-            s_admin_websockets[admin].mac,
-            0,
-            sizeof(s_admin_websockets[admin].mac)
-         );
-
-         return;
-      }
-   }
-}
-
-// Reset all administrator WebSocket slots to an unused state.
-static void initialize_admin_websockets(void)
-{
-   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
-   {
-      s_admin_websockets[admin].socket_fd = -1;
-
-      memset(
-         s_admin_websockets[admin].mac,
-         0,
-         sizeof(s_admin_websockets[admin].mac)
+      cJSON_AddStringToObject(
+         response,
+         "error",
+         esp_err_to_name(action_status)
       );
    }
+
+   char *message = cJSON_PrintUnformatted(response);
+
+   cJSON_Delete(response);
+
+   if (message == NULL) return ESP_ERR_NO_MEM;
+
+   // Prepare the JSON text as a WebSocket frame
+   httpd_ws_frame_t frame = {
+      .final = true,
+      .fragmented = false,
+      .type = HTTPD_WS_TYPE_TEXT,
+      .payload = (uint8_t *)message,
+      .len = strlen(message)
+   };
+
+   // Send directly to the administrator who submitted the action
+   esp_err_t status = httpd_ws_send_frame_async(
+      s_server,
+      socket_fd,
+      &frame
+   );
+
+   // The synchronous send call has completed using the payload
+   cJSON_free(message);
+
+   return status;
 }
 
 /*
@@ -226,6 +276,286 @@ static esp_err_t get_request_client_ip(
    return ESP_ERR_NOT_SUPPORTED;
 }
 
+// Get the MAC address of the client making an HTTP request
+static esp_err_t get_request_client_mac(
+   httpd_req_t *request,
+   uint8_t mac[6]
+)
+{
+   if (request == NULL || mac == NULL) return ESP_ERR_INVALID_ARG;
+
+   esp_ip4_addr_t client_ip;
+
+   esp_err_t status = get_request_client_ip(
+      request,
+      &client_ip
+   );
+
+   if (status != ESP_OK) return status;
+
+   return client_manager_get_mac_by_ip(
+      &client_ip,
+      mac
+   );
+}
+
+// Check whether an HTTP request belongs to an authenticated administrator
+static bool is_admin_http_request(httpd_req_t *request)
+{
+   if (request == NULL) return false;
+
+   uint8_t client_mac[6];
+
+   esp_err_t status = get_request_client_mac(
+      request,
+      client_mac
+   );
+
+   if (status != ESP_OK) return false;
+
+   return client_manager_is_admin(client_mac);
+}
+
+// Send an appropriate HTTP error for a controller request
+static esp_err_t send_controller_request_error(
+   httpd_req_t *request,
+   esp_err_t status
+)
+{
+   if (status == ESP_ERR_INVALID_STATE)
+   {
+      httpd_resp_set_status(request, "409 Conflict");
+
+      return httpd_resp_send(
+         request,
+         "Controller request already pending or authorized",
+         HTTPD_RESP_USE_STRLEN
+      );
+   }
+      
+   if (status == ESP_ERR_NOT_FOUND || status == ESP_ERR_NOT_SUPPORTED)
+      return httpd_resp_send_err(request, HTTPD_403_FORBIDDEN, "Unable to identify client");
+
+   ESP_LOGE(
+      LOG_TAG,
+      "Controller request failed: %s",
+      esp_err_to_name(status)
+   );
+
+   return httpd_resp_send_err(
+      request,
+      HTTPD_500_INTERNAL_SERVER_ERROR,
+      "Unable to process controller request"
+   );
+}
+
+// Process a controller access request from a connected client
+static esp_err_t process_controller_request(httpd_req_t *request)
+{
+   esp_err_t status = client_manager_sync_connected_clients();
+
+   if (status != ESP_OK) return status;
+
+   uint8_t client_mac[6];
+
+   status = get_request_client_mac(
+      request,
+      client_mac
+   );
+
+   if (status != ESP_OK) return status;
+
+   return client_manager_request_controller(client_mac);
+}
+
+// Handle controller access requests
+static esp_err_t controller_request_post_handler(httpd_req_t *request)
+{
+   if (request == NULL) return ESP_ERR_INVALID_ARG;
+
+   esp_err_t status = process_controller_request(request);
+
+   if (status != ESP_OK)
+      return send_controller_request_error(request, status);
+
+   status = web_server_notify_clients_changed();
+
+   if (status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Administrator notification failed: %s",
+         esp_err_to_name(status)
+      );
+   }
+
+   httpd_resp_set_type(request, "application/json");
+
+   return httpd_resp_send(
+      request,
+      "{\"status\":\"pending\"}",
+      HTTPD_RESP_USE_STRLEN
+   );
+}
+
+/*
+   Add an authenticated administrator WebSocket to the active registry.
+
+   If the same device reconnects, its existing entry is updated rather
+   than consuming another WebSocket slot.
+*/
+static esp_err_t register_admin_websocket(
+   int socket_fd,
+   const uint8_t mac[6]
+)
+{
+   if (socket_fd < 0 || mac == NULL)
+      return ESP_ERR_INVALID_ARG;
+
+   // Update the existing entry if this administrator reconnects.
+   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
+   {
+      if (memcmp(
+            s_admin_websockets[admin].mac,
+            mac,
+            sizeof(s_admin_websockets[admin].mac)
+         ) == 0)
+      {
+         s_admin_websockets[admin].socket_fd = socket_fd;
+         return ESP_OK;
+      }
+   }
+
+   // Otherwise use the first available WebSocket slot.
+   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
+   {
+      if (s_admin_websockets[admin].socket_fd < 0)
+      {
+         s_admin_websockets[admin].socket_fd = socket_fd;
+
+         memcpy(
+            s_admin_websockets[admin].mac,
+            mac,
+            sizeof(s_admin_websockets[admin].mac)
+         );
+
+         return ESP_OK;
+      }
+   }
+
+   return ESP_ERR_NO_MEM;
+}
+
+// Check whether a WebSocket belongs to an authenticated administrator
+static bool is_admin_websocket(int socket_fd)
+{
+   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
+   {
+      if (s_admin_websockets[admin].socket_fd != socket_fd)
+         continue;
+
+      // Verify current authorization, not just WebSocket registration
+      return client_manager_is_admin(
+         s_admin_websockets[admin].mac
+      );
+   }
+
+   return false;
+}
+
+// Check whether an administrator WebSocket is still connected
+static bool is_admin_websocket_connected(int socket_fd)
+{
+   if (s_server == NULL || socket_fd < 0)
+      return false;
+
+   // Confirm the socket is still registered as an active WebSocket
+   httpd_ws_client_info_t socket_info = httpd_ws_get_fd_info(
+      s_server,
+      socket_fd
+   );
+
+   return socket_info == HTTPD_WS_CLIENT_WEBSOCKET;
+}
+
+// Process an incoming administrator WebSocket text message
+static esp_err_t process_admin_websocket_message(
+   int socket_fd,
+   const char *message
+)
+{
+   if (message == NULL) return ESP_ERR_INVALID_ARG;
+
+   // Reject messages from sockets without current administrator authorization
+   if (!is_admin_websocket(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   // Convert the JSON text into an object containing the requested action
+   cJSON *root = cJSON_Parse(message);
+
+   if (root == NULL) return ESP_ERR_INVALID_ARG;
+
+   esp_err_t status = process_admin_controller_action(root);
+
+   // Release the parsed JSON object after processing the action
+   cJSON_Delete(root);
+
+   if (status != ESP_OK) return status;
+
+   // Notify every connected administrator that client authorization changed
+   status = web_server_notify_clients_changed();
+
+   if (status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Administrator notification failed: %s",
+         esp_err_to_name(status)
+      );
+   }
+
+   return ESP_OK;
+}
+
+/*
+   Remove an administrator WebSocket from the active registry.
+*/
+static void remove_admin_websocket(
+   int socket_fd
+)
+{
+   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
+   {
+      if (s_admin_websockets[admin].socket_fd == socket_fd)
+      {
+         s_admin_websockets[admin].socket_fd = -1;
+
+         memset(
+            s_admin_websockets[admin].mac,
+            0,
+            sizeof(s_admin_websockets[admin].mac)
+         );
+
+         return;
+      }
+   }
+}
+
+// Reset all administrator WebSocket slots to an unused state.
+static void initialize_admin_websockets(void)
+{
+   for (size_t admin = 0; admin < WEB_MAX_CLIENTS; admin++)
+   {
+      s_admin_websockets[admin].socket_fd = -1;
+
+      memset(
+         s_admin_websockets[admin].mac,
+         0,
+         sizeof(s_admin_websockets[admin].mac)
+      );
+   }
+}
+
 /*
    Send one frontend file embedded in the firmware.
 
@@ -293,89 +623,9 @@ static esp_err_t frontend_css_get_handler(httpd_req_t *request)
    );
 }
 
-/*
-   Get clients currently connected to the ESP32 WiFi access point.
-
-   The WiFi driver provides associated station MAC addresses.
-   ESP-NETIF resolves those addresses to DHCP-assigned IPs.
-*/
-static esp_err_t get_connected_clients(
-   web_client_t *clients,
-   size_t max_clients,
-   size_t *client_count
-)
-{
-   if (clients == NULL ||
-      client_count == NULL ||
-      max_clients == 0)
-   {
-      return ESP_ERR_INVALID_ARG;
-   }
-
-   *client_count = 0;
-
-   // Get stations currently associated with the access point
-   wifi_sta_list_t station_list = {0};
-
-   esp_err_t status = esp_wifi_ap_get_sta_list(
-      &station_list
-   );
-
-   if (status != ESP_OK) return status;
-
-   size_t count = station_list.num;
-
-   if (count > max_clients)
-      count = max_clients;
-
-   // Store MAC/IP pairs for ESP-NETIF to resolve
-   esp_netif_pair_mac_ip_t network_list[WEB_MAX_CLIENTS] = {0};
-
-   for (size_t client = 0; client < count; client++)
-   {
-      memcpy(
-         network_list[client].mac,
-         station_list.sta[client].mac,
-         sizeof(network_list[client].mac)
-      );
-   }
-
-   // Get the ESP32 SoftAP network interface
-   esp_netif_t *ap_netif = esp_netif_get_handle_from_ifkey(
-      "WIFI_AP_DEF"
-   );
-
-   if (ap_netif == NULL) return ESP_ERR_INVALID_STATE;
-
-   // Resolve station MAC addresses to DHCP-assigned IPv4 addresses
-   status = esp_netif_dhcps_get_clients_by_mac(
-      ap_netif,
-      (int)count,
-      network_list
-   );
-
-   if (status != ESP_OK) return status;
-
-   // Copy resolved client information into application structures
-   for (size_t client = 0; client < count; client++)
-   {
-      memcpy(
-         clients[client].mac,
-         network_list[client].mac,
-         sizeof(clients[client].mac)
-      );
-
-      clients[client].ip = network_list[client].ip;
-   }
-
-   *client_count = count;
-
-   return ESP_OK;
-}
-
 // Convert connected client MAC/IP information into dashboard JSON
 static cJSON *create_clients_json(
-   const web_client_t *clients,
+   const client_record_t *clients,
    size_t client_count
 )
 {
@@ -427,6 +677,12 @@ static cJSON *create_clients_json(
          client_json,
          "ip",
          ip_address
+      );
+
+      cJSON_AddNumberToObject(
+         client_json,
+         "auth_state",
+         clients[client].auth_state
       );
 
       cJSON_AddItemToArray(
@@ -606,29 +862,58 @@ static esp_err_t admin_clients_get_handler(httpd_req_t *request)
 {
    if (request == NULL) return ESP_ERR_INVALID_ARG;
 
-   // Refresh the new client registry before returning connected devices
-   esp_err_t manager_status = client_manager_sync_connected_clients();
+   // Restrict the client registry to authenticated administrators
+   if (!is_admin_http_request(request))
+   {
+      return httpd_resp_send_err(
+         request,
+         HTTPD_403_FORBIDDEN,
+         "Administrator authorization required"
+      );
+   }
 
-   if (manager_status != ESP_OK)
+   // Refresh the new client registry before returning connected devices
+   esp_err_t status = client_manager_sync_connected_clients();
+
+   if (status != ESP_OK)
    {
       ESP_LOGE(
          LOG_TAG,
          "Client manager sync failed: %s",
-         esp_err_to_name(manager_status)
+         esp_err_to_name(status)
+      );
+
+      return httpd_resp_send_err(
+         request,
+         HTTPD_500_INTERNAL_SERVER_ERROR,
+         "Unable to refresh connected clients"
       );
    }
 
-   web_client_t clients[WEB_MAX_CLIENTS];
+   client_record_t clients[CLIENT_MANAGER_MAX_CLIENTS];
    size_t client_count = 0;
 
-   // Retrieve the current clients from the WiFi access point
-   esp_err_t status = get_connected_clients(
+   // Retrieve the current clients from WiFi access point
+   status = client_manager_get_clients(
       clients,
-      WEB_MAX_CLIENTS,
+      CLIENT_MANAGER_MAX_CLIENTS,
       &client_count
    );
 
-   if (status != ESP_OK) return status;
+   if (status != ESP_OK)
+   {
+      ESP_LOGE(
+         LOG_TAG,
+         "Failed to retrieve connected clients: %s",
+         esp_err_to_name(status)
+      );
+
+      return httpd_resp_send_err(
+         request,
+         HTTPD_500_INTERNAL_SERVER_ERROR,
+         "Unable to retrieve connected clients"
+      );
+   }
 
    // Convert the client information into the dashboard API format
    cJSON *clients_json = create_clients_json(
@@ -674,28 +959,12 @@ static esp_err_t websocket_handler(httpd_req_t *request)
 
    if (request->method == HTTP_GET)
    {
-      esp_ip4_addr_t client_ip;
-
-      // Identify the device opening this WebSocket connection.
-      esp_err_t status = get_request_client_ip(
-         request,
-         &client_ip
-      );
-
-      if (status != ESP_OK)
-      {
-         ESP_LOGW(
-            LOG_TAG,
-            "Unable to identify WebSocket client"
-         );
-
-         return status;
-      }
 
       uint8_t client_mac[6];
 
-      status = client_manager_get_mac_by_ip(
-         &client_ip,
+      // Identify device opening the WebSocket connection
+      esp_err_t status = get_request_client_mac(
+         request,
          client_mac
       );
 
@@ -703,7 +972,8 @@ static esp_err_t websocket_handler(httpd_req_t *request)
       {
          ESP_LOGW(
             LOG_TAG,
-            "WebSocket client was not found in the client registry"
+            "Unable to identify WebSocket client: %s",
+            esp_err_to_name(status)
          );
 
          return status;
@@ -772,9 +1042,10 @@ static esp_err_t websocket_handler(httpd_req_t *request)
       return status;
    }
 
+   int socket_fd = httpd_req_to_sockfd(request);
+
    if (frame.type == HTTPD_WS_TYPE_CLOSE)
    {
-      int socket_fd = httpd_req_to_sockfd(request);
 
       remove_admin_websocket(socket_fd);
 
@@ -782,6 +1053,65 @@ static esp_err_t websocket_handler(httpd_req_t *request)
          LOG_TAG,
          "Administrator WebSocket disconnected"
       );
+
+      return ESP_OK;
+   }
+
+   // Ignore control frames and unsupported message types
+   if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
+
+   // Reject fragmented messages
+   if (frame.fragmented || !frame.final) return ESP_ERR_NOT_SUPPORTED;
+
+   // Limit incoming JSON messages to 512 bytes
+   if (frame.len == 0 || frame.len > 512) return ESP_ERR_INVALID_SIZE;
+
+   // Allocate extra byte for terminating null character
+   char message[513];
+
+   frame.payload = (uint8_t *)message;
+
+   // Read the actual WebSocket message payload
+   esp_err_t receive_status = httpd_ws_recv_frame(
+      request,
+      &frame,
+      512
+   );
+
+   if (receive_status != ESP_OK) return receive_status;
+
+   // Terminate the received bytes so cJSON can parse the string
+   message[frame.len] = '\0';
+
+   esp_err_t process_status = process_admin_websocket_message(
+      socket_fd,
+      message
+   );
+
+   if (process_status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Administrator WebSocket action failed: %s",
+         esp_err_to_name(process_status)
+      );
+   }
+
+   // Send the action result to admin who submitted
+   esp_err_t response_status = send_admin_websocket_response(
+      socket_fd,
+      process_status
+   );
+
+   if (response_status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Failed to send administrator WebSocket response: %s",
+         esp_err_to_name(response_status)
+      );
+
+      return response_status;
    }
 
    return ESP_OK;
@@ -852,6 +1182,14 @@ static esp_err_t register_uri_handlers(void)
       "/api/admin/clients",
       HTTP_GET,
       admin_clients_get_handler,
+      false
+   );
+   if (status != ESP_OK) return status;
+
+   status = register_uri_handler(
+      "/api/controller/request",
+      HTTP_POST,
+      controller_request_post_handler,
       false
    );
    if (status != ESP_OK) return status;

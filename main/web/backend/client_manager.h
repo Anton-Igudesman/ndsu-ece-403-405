@@ -8,6 +8,8 @@
 #include "esp_err.h"
 #include "esp_netif_ip_addr.h"
 
+#define CLIENT_MANAGER_MAX_CLIENTS 8U
+
 typedef enum{
    CLIENT_AUTH_NONE = 0,
    CLIENT_AUTH_PENDING,
@@ -27,12 +29,20 @@ esp_err_t client_manager_sync_connected_clients(void);
 
 esp_err_t client_manager_set_admin(const uint8_t mac[6]);
 esp_err_t client_manager_set_admin_by_ip(const esp_ip4_addr_t *ip);
+esp_err_t client_manager_set_pending(const uint8_t mac[6]);
+esp_err_t client_manager_set_none(const uint8_t mac[6]);
 
 esp_err_t client_manager_get_mac_by_ip(
    const esp_ip4_addr_t *ip,
    uint8_t mac[6]
 );
 
+esp_err_t client_manager_get_auth_state(
+   const uint8_t mac[6],
+   client_auth_state_t *auth_state
+);
+
+esp_err_t client_manager_request_controller(const uint8_t mac[6]);
 esp_err_t client_manager_set_controller(const uint8_t mac[6]);
 bool client_manager_is_admin(const uint8_t mac[6]);
 bool client_manager_is_authorized(const uint8_t mac[6]);
@@ -42,5 +52,8 @@ esp_err_t client_manager_get_clients(
    size_t max_clients,
    size_t *client_count
 );
+
+esp_err_t client_manager_approve_controller(const uint8_t mac[6]);
+esp_err_t client_manager_deny_controller(const uint8_t mac[6]);
 
 #endif
