@@ -398,6 +398,63 @@ static esp_err_t controller_request_post_handler(httpd_req_t *request)
    );
 }
 
+// Return the requesting client's current authorization state
+static esp_err_t controller_status_get_handler(httpd_req_t *request)
+{
+   if (request == NULL) return ESP_ERR_INVALID_ARG;
+
+   uint8_t client_mac[6];
+
+   esp_err_t status = client_manager_sync_connected_clients();
+
+   if (status != ESP_OK)
+      return httpd_resp_send_err(
+         request,
+         HTTPD_500_INTERNAL_SERVER_ERROR,
+         "Unable to refresh connected clients"
+      );
+
+   status = get_request_client_mac(request, client_mac);
+
+   if (status != ESP_OK)
+      return httpd_resp_send_err(
+         request,
+         HTTPD_403_FORBIDDEN,
+         "Unable to identify client"
+      );
+
+   client_auth_state_t auth_state;
+
+   status = client_manager_get_auth_state(
+      client_mac,
+      &auth_state
+   );
+
+   if (status != ESP_OK)
+      return httpd_resp_send_err(
+         request,
+         HTTPD_500_INTERNAL_SERVER_ERROR,
+         "Unable to retrieve authorization state"
+      );
+
+   char response[32];
+
+   snprintf(
+      response,
+      sizeof(response),
+      "{\"auth_state\":%d}",
+      (int)auth_state
+   );
+
+   httpd_resp_set_type(request, "application/json");
+
+   return httpd_resp_send(
+      request,
+      response,
+      HTTPD_RESP_USE_STRLEN
+   );
+}
+
 /*
    Add an authenticated administrator WebSocket to the active registry.
 
@@ -1190,6 +1247,14 @@ static esp_err_t register_uri_handlers(void)
       "/api/controller/request",
       HTTP_POST,
       controller_request_post_handler,
+      false
+   );
+   if (status != ESP_OK) return status;
+
+   status = register_uri_handler(
+      "/api/controller/status",
+      HTTP_GET,
+      controller_status_get_handler,
       false
    );
    if (status != ESP_OK) return status;

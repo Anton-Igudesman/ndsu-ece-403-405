@@ -1,10 +1,37 @@
 <script>
   import { onMount } from 'svelte'
   
-  /** @type {{ mac: string, ip: string }[]} */
-  let clients = []
-  let loading = true
-  let errorMessage = ''
+  /** @type {{ mac: string, ip: string, auth_state: number }[]} */
+  let clients = $state([])
+
+  const AUTH_NONE = 0
+  const AUTH_PENDING = 1
+  const AUTH_CONTROLLER = 2
+  const AUTH_ADMIN = 3
+
+  // Convert the client authorization state into a readable label
+  /** @param {number} authState */
+  function getAuthLabel(authState) {
+    switch (authState) {
+      case AUTH_NONE:
+        return 'Not Authorized'
+      case AUTH_PENDING:
+        return 'Pending Approval'
+      case AUTH_CONTROLLER:
+        return 'Controller'
+      case AUTH_ADMIN:
+        return 'Administrator'
+      default:
+        return 'Unknown'
+    }
+  }
+
+  let loading = $state(true)
+  let errorMessage = $state('')
+  let actionErrorMessage = $state('')
+
+  /** @type {WebSocket | null} */
+  let adminSocket = null
 
   async function loadClients() {
     try {
@@ -23,6 +50,24 @@
     }
   }
 
+  // Send a controller approval or denial to the ESP32
+  /**
+   * @param {string} action
+   * @param {string} mac
+   */
+  function sendControllerAction(action, mac) {
+    if (!adminSocket || adminSocket.readyState !== WebSocket.OPEN) {
+      errorMessage = 'Administrator connection is unavailable'
+      return
+    }
+
+    // Send the action and target client MAC through the existing WebSocket
+    adminSocket.send(JSON.stringify({
+      action,
+      mac
+    }))
+  }
+
   /*
    Load the current client list when the dashboard opens.
 
@@ -36,29 +81,39 @@
     const protocol = 
       window.location.protocol === 'https:' ? 'wss:' : 'ws:'
 
-    const socket = new WebSocket(
+    adminSocket = new WebSocket(
       `${protocol}//${window.location.host}/ws`
     )
 
-    socket.onmessage = (event) => {
+    adminSocket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data)
 
         if (message.event === 'clients_changed') {
           loadClients()
         }
+
+        if (message.event === 'controller_action_result') {
+          if (message.success) {
+            errorMessage = ''
+            loadClients()
+          } else {
+            actionErrorMessage = `Controller action failed: ${message.error || 'Unknown error'}`
+          }
+        }
       } catch {
         console.error('Invalid WebSocket message received')
       }
     }
 
-    socket.onerror = () => {
+    adminSocket.onerror = () => {
       errorMessage = 'Dashboard live connection failed'
     }
 
     // Close the WebSocket when the dashboard is no longer active
     return () => {
-      socket.close()
+      adminSocket?.close()
+      adminSocket = null
     }
   })
 </script>
@@ -117,6 +172,9 @@
             <th class="px-6 py-4 font-medium">
               Status
             </th>
+            <th class="px-6 py-4 text-left text-sm font-semibold text-slate-400">
+              Actions
+            </th>
           </tr>
         </thead>
 
@@ -132,13 +190,34 @@
               </td>
 
               <td class="px-6 py-5">
-                <div class="flex items-center gap-2">
-                  <span class="h-2 w-2 rounded-full bg-green-500"></span>
+                <span
+                  class:text-yellow-400={client.auth_state === AUTH_PENDING}
+                  class:text-green-400={client.auth_state === AUTH_CONTROLLER}
+                  class:text-blue-400={client.auth_state === AUTH_ADMIN}
+                  class:text-slate-400={client.auth_state === AUTH_NONE}
+                  class="text-sm"
+                >
+                  {getAuthLabel(client.auth_state)}
+                </span>
+              </td>
+              <td class="px-6 py-5">
+                {#if client.auth_state === AUTH_PENDING}
+                  <div class="flex gap-3">
+                    <button
+                      onclick={() => sendControllerAction('approve_controller', client.mac)}
+                      class="rounded-lg bg-green-600 px-4 py-2 text-sm font-semibold text-white hover:bg-green-500"
+                    >
+                      Approve
+                    </button>
 
-                  <span class="text-sm text-green-400">
-                    Connected
-                  </span>
-                </div>
+                    <button
+                      onclick={() => sendControllerAction('deny_controller', client.mac)}
+                      class="rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500"
+                    >
+                      Deny
+                    </button>
+                  </div>
+                {/if}
               </td>
             </tr>
           {/each}
@@ -146,7 +225,7 @@
           {#if !loading && clients.length === 0 && !errorMessage}
             <tr>
               <td
-                colspan="3"
+                colspan="4"
                 class="px-6 py-12 text-center text-sm text-slate-500"
               >
                 No clients connected
@@ -165,6 +244,11 @@
       {#if errorMessage}
         <div class="border-t border-slate-800 px-6 py-4 text-sm text-red-400">
           {errorMessage}
+        </div>
+      {/if}
+      {#if actionErrorMessage}
+        <div class="border-t border-slate-800 px-6 py-4 text-sm text-red-400">
+          {actionErrorMessage}
         </div>
       {/if}
     </div>
