@@ -1355,6 +1355,13 @@ esp_err_t web_server_notify_clients_changed(void)
       if (socket_fd < 0)
          continue;
 
+      // Remove WebSocket entries no longer recognized by the HTTP server
+      if (!is_admin_websocket_connected(socket_fd))
+      {
+         remove_admin_websocket(socket_fd);
+         continue;
+      }
+
       esp_err_t status = httpd_ws_send_frame_async(
          s_server,
          socket_fd,
