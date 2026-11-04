@@ -41,6 +41,7 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
       case LED_MODE_AUDIO_EQ:
       case LED_MODE_POCKETS:
       case LED_MODE_OFF:
+      case LED_MODE_COMMAND:
          break;
 
       default:
@@ -144,6 +145,10 @@ esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
             0U,
             0U
          );
+
+      case LED_MODE_COMMAND:
+         // Terminal commands control the framebuffer in this mode
+         return ESP_OK;
 
       default:
          return ESP_ERR_INVALID_STATE;
