@@ -14,7 +14,7 @@ esp_err_t terminal_session_manager_init(void);
 
 // Register or remove a terminal connection
 esp_err_t terminal_session_manager_register(int socket_fd, const uint8_t mac[6]);
-void terminal_session_manager_unregister(int socket_fd);
+bool terminal_session_manager_unregister(int socket_fd);
 
 // Check whether a connection currently owns the terminal
 bool terminal_session_manager_is_owner(int socket_fd);
@@ -39,6 +39,9 @@ size_t terminal_session_manager_get_pending_requests(
 
 // Request terminal control from the current owner
 esp_err_t terminal_session_manager_request_control(int socket_fd);
+
+// Check whether a device has an outstanding terminal control request
+bool terminal_session_manager_has_pending_request(int socket_fd);
 
 // Grant or deny a pending control request
 esp_err_t terminal_session_manager_grant_control(

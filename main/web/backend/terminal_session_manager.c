@@ -171,10 +171,11 @@ esp_err_t terminal_session_manager_register(int socket_fd, const uint8_t mac[6])
 }
 
 // Remove a terminal connection while preserving device ownership
-void terminal_session_manager_unregister(int socket_fd)
+// Return true when pending-request list changed during disconnection
+bool terminal_session_manager_unregister(int socket_fd)
 {
    terminal_client_t *client = find_client(socket_fd);
-   if (client == NULL) return;
+   if (client == NULL) return false;
 
    uint8_t client_mac[6];
    memcpy(client_mac, client->mac, sizeof(client_mac));
@@ -182,11 +183,17 @@ void terminal_session_manager_unregister(int socket_fd)
    clear_client(client);
 
    // Keep ownershp if another tab from the same device remains connected
-   if (find_client_by_mac(client_mac) != NULL) return;
+   if (find_client_by_mac(client_mac) != NULL) return false;
+
+   bool pending_requests_changed = false;
 
    // Remove pending requests when the device's last connection closes
    terminal_request_t *pending = find_pending_request(client_mac);
-   if (pending != NULL) clear_request(pending);
+   if (pending != NULL)
+   {
+      clear_request(pending);
+      pending_requests_changed = true;
+   }
 
    // Release ownership when the controlling client disconnects
    if (s_owner_present && memcmp(s_owner_mac, client_mac, sizeof(client_mac)) == 0)
@@ -194,9 +201,21 @@ void terminal_session_manager_unregister(int socket_fd)
       memset(s_owner_mac, 0, sizeof(s_owner_mac));
       s_owner_present = false;
 
+      // Check whether clearing remaining requests changes pending list
+      for (size_t i = 0; i < TERMINAL_MAX_CLIENTS; i++)
+      {
+         if (s_pending_requests[i].active)
+         {
+            pending_requests_changed = true;
+            break;
+         }
+      }
+
       // Clear pending control requests after owning device disconnects
       clear_all_pending_requests();
    }
+
+   return pending_requests_changed;
 }
 
 // Check whether a registered connection currently owns the terminal
@@ -265,6 +284,15 @@ esp_err_t terminal_session_manager_request_control(int socket_fd)
    request->active = true;
 
    return ESP_OK;
+}
+
+// Check whether a registered device has a pending terminal control request
+bool terminal_session_manager_has_pending_request(int socket_fd)
+{
+   terminal_client_t *client = find_client(socket_fd);
+   if (client == NULL) return false;
+
+   return find_pending_request(client->mac) != NULL;
 }
 
 // Retrieve registered terminal connections without exposing the internal registry

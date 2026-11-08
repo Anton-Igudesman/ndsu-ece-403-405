@@ -46,8 +46,8 @@ typedef struct
    const char *event;
    esp_err_t (*handler)(httpd_req_t *request, const cJSON *root);
    bool affects_ownership;
+   bool affects_pending_requests;
 } terminal_action_entry_t;
-
 
 // Track WebSocket connections for all currently connected administrators
 static admin_websocket_t s_admin_websockets[WEB_MAX_CLIENTS];
@@ -71,10 +71,6 @@ extern const uint8_t app_css_start[]
 extern const uint8_t app_css_end[]
    asm("_binary_app_css_end");
 
-// -----------------------------------------------------------
-// ---------------- Private Function Definitions -------------
-// -----------------------------------------------------------
-
 // ------- Forward declarations ---------
 static esp_err_t get_request_client_mac(
    httpd_req_t *request,
@@ -87,6 +83,166 @@ static esp_err_t send_websocket_json(
 );
 
 static esp_err_t notify_terminal_ownership_changed(void);
+static void broadcast_terminal_ownership_changed(void);
+static void broadcast_terminal_pending_requests(void);
+
+// Notify the owning device of the current pending control requests
+static esp_err_t notify_terminal_pending_requests(void);
+
+// -----------------------------------------------------------
+// ---------------- Private Function Definitions -------------
+// -----------------------------------------------------------
+
+// Broadcast pending-request updates without affecting the original operation
+static void broadcast_terminal_pending_requests(void)
+{
+   esp_err_t status = notify_terminal_pending_requests();
+
+   if (status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Terminal pending-request notification failed: %s",
+         esp_err_to_name(status)
+      );
+   }
+}
+
+// Create a notification containing the current pending control requests
+static cJSON *create_pending_requests_notification(cJSON *requests)
+{
+   if (requests == NULL) return NULL;
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return NULL;
+
+   if (cJSON_AddStringToObject(response, "event", "terminal_pending_requests") == NULL)
+   {
+      cJSON_Delete(response);
+      return NULL;
+   }
+
+   // Transfer ownership of the requests array to the notification
+   if (!cJSON_AddItemToObject(response, "requests", requests))
+   {
+      cJSON_Delete(response);
+      return NULL;
+   }
+
+   return response;
+}
+
+// Send a pending-request notification to all connections on the owning device
+static esp_err_t send_pending_requests_to_owner(const cJSON *response)
+{
+   if (response == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fds[TERMINAL_MAX_CLIENTS];
+
+   size_t client_count = terminal_session_manager_get_clients(
+      socket_fds,
+      TERMINAL_MAX_CLIENTS
+   );
+
+   esp_err_t final_status = ESP_OK;
+
+   for (size_t i = 0; i < client_count; i++)
+   {
+      if (!terminal_session_manager_is_owner(socket_fds[i])) continue;
+
+      esp_err_t status = send_websocket_json(socket_fds[i], response);
+      if (status != ESP_OK) final_status = status;
+   }
+
+   return final_status;
+}
+
+// Create a JSON array containing pending terminal control requests
+static cJSON *create_pending_requests_json(
+   const int *requester_fds,
+   size_t request_count
+)
+{
+   if (requester_fds == NULL && request_count > 0U) return NULL;
+
+   cJSON *requests = cJSON_CreateArray();
+   if (requests == NULL) return NULL;
+
+   for (size_t i = 0; i < request_count; i++)
+   {
+      cJSON *request = cJSON_CreateObject();
+
+      if (request == NULL)
+      {
+         cJSON_Delete(requests);
+         return NULL;
+      }
+
+      if (cJSON_AddNumberToObject(request, "requester_fd", requester_fds[i]) == NULL)
+      {
+         cJSON_Delete(request);
+         cJSON_Delete(requests);
+         return NULL;
+      }
+      cJSON_AddItemToArray(requests, request);
+   }
+
+   return requests;
+}
+
+// Notify the owning device of pending terminal control requests
+static esp_err_t notify_terminal_pending_requests(void)
+{
+   int requester_fds[TERMINAL_MAX_CLIENTS];
+
+   size_t request_count = terminal_session_manager_get_pending_requests(
+      requester_fds,
+      TERMINAL_MAX_CLIENTS
+   );
+
+   cJSON *requests = create_pending_requests_json(
+      requester_fds,
+      request_count
+   );
+
+   if (requests == NULL) return ESP_ERR_NO_MEM;
+
+   // Build the notification from pending requests
+   cJSON *response = create_pending_requests_notification(requests);
+
+   if (response == NULL)
+   {
+      cJSON_Delete(requests);
+      return ESP_ERR_NO_MEM;
+   }
+
+   // Deliver the notificatoin and release its JSON data
+   esp_err_t status = send_pending_requests_to_owner(response);
+   cJSON_Delete(response);
+
+   return status;
+}
+
+// Execute a terminal action and notify clients of ownershp and request updates
+static esp_err_t execute_terminal_action(
+   const terminal_action_entry_t *entry,
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (entry == NULL) return ESP_ERR_INVALID_ARG;
+
+   esp_err_t status = entry->handler(request, root);
+   if(status != ESP_OK) return status;
+
+   // Send the updated request list to the current owning device
+   if (entry->affects_pending_requests) broadcast_terminal_pending_requests();
+
+   // Notify all devices after ownership or pending-request changes
+   if (entry->affects_ownership || entry->affects_pending_requests) broadcast_terminal_ownership_changed();
+
+   return status;
+}
 
 // Return the current LED operating mode
 static esp_err_t handle_terminal_get_mode(
@@ -97,6 +253,22 @@ static esp_err_t handle_terminal_get_mode(
    (void)request;
 
    return web_terminal_execute(root);
+}
+
+// Broadcast ownership changes without affecting original operation
+static void broadcast_terminal_ownership_changed(void)
+{
+   esp_err_t status = notify_terminal_ownership_changed();
+
+   // A notification failure must not invalidate an ownership change
+   if (status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Terminal ownership notification failed: %s",
+         esp_err_to_name(status)
+      );
+   }
 }
 
 // Request terminal ownership for the connected client
@@ -225,6 +397,13 @@ static esp_err_t handle_terminal_get_ownership(
    cJSON_AddBoolToObject(response, "is_owner", terminal_session_manager_is_owner(socket_fd));
    cJSON_AddBoolToObject(response, "owner_present", terminal_session_manager_get_owner() >= 0);
 
+   // Report whether the requesting device has a pending control request
+   cJSON_AddBoolToObject(
+      response,
+      "request_pending",
+      terminal_session_manager_has_pending_request(socket_fd)
+   );
+
    esp_err_t status = send_websocket_json(
       socket_fd,
       response
@@ -238,14 +417,14 @@ static esp_err_t handle_terminal_get_ownership(
 // Map terminal actions to their response events and handlers
 static const terminal_action_entry_t s_terminal_actions[] = 
 {
-   {"get_mode", "mode_status", handle_terminal_get_mode, false},
-   {"set_mode", "mode_activation_result", handle_terminal_set_mode, false},
-   {"request_control", "control_request_result", handle_terminal_request_control, true},
-   {"release_control", "control_release_result", handle_terminal_release_control, true},
-   {"grant_control", "control_grant_result", handle_terminal_grant_control, true},
-   {"deny_control", "control_deny_result", handle_terminal_deny_control, false},
-   {"admin_takeover", "control_takeover_result", handle_terminal_admin_takeover, true},
-   {"get_ownership", "terminal_ownership_status_result", handle_terminal_get_ownership, false},
+   {"get_mode", "mode_status", handle_terminal_get_mode, false, false},
+   {"set_mode", "mode_activation_result", handle_terminal_set_mode, false, false},
+   {"request_control", "control_request_result", handle_terminal_request_control, true, true},
+   {"release_control", "control_release_result", handle_terminal_release_control, true, true},
+   {"grant_control", "control_grant_result", handle_terminal_grant_control, true, true},
+   {"deny_control", "control_deny_result", handle_terminal_deny_control, false, true},
+   {"admin_takeover", "control_takeover_result", handle_terminal_admin_takeover, true, true},
+   {"get_ownership", "terminal_ownership_status_result", handle_terminal_get_ownership, false, false},
 };
 
 // Resolve and execute a terminal action using the registered handlers
@@ -276,26 +455,8 @@ static esp_err_t dispatch_terminal_action(
 
       *event = entry->event;
       
-      // Capture ownership before executing actions that may transfer control
-      int previous_owner = entry->affects_ownership
-         ? terminal_session_manager_get_owner()
-         : -1;
-
-      esp_err_t status = entry->handler(request, root);
-
-      // Broadcast only when the action successfully changes terminal ownership
-      if (status == ESP_OK && entry->affects_ownership &&
-         previous_owner != terminal_session_manager_get_owner())
-      {
-         esp_err_t notify_status = notify_terminal_ownership_changed();
-
-         // Notification failures must not undo a successful ownership transfer
-         if (notify_status != ESP_OK)
-            ESP_LOGW(LOG_TAG,
-               "Terminal ownership notification failed: %s",
-               esp_err_to_name(notify_status));
-      }
-      return status;
+      // Execute the matched action and handle ownership notifications
+      return execute_terminal_action(entry, request, root);   
    }
 
    return ESP_ERR_NOT_SUPPORTED;
@@ -467,6 +628,13 @@ static esp_err_t notify_terminal_ownership_changed(void)
 
       // Each client receives its own ownership status
       cJSON_AddStringToObject(response, "event", "terminal_ownership_changed");
+
+      // Report each device's pending-request status alongside ownership changes
+      cJSON_AddBoolToObject(
+         response,
+         "request_pending",
+         terminal_session_manager_has_pending_request(socket_fds[i])
+      );
 
       // All connections from a device must report the same ownership state
       bool is_owner = terminal_session_manager_is_owner(socket_fds[i]);
@@ -1350,24 +1518,7 @@ static esp_err_t terminal_websocket_handler(httpd_req_t *request)
 
    status = httpd_ws_recv_frame(request, &frame, 0);
 
-   if (status != ESP_OK)
-   {
-      terminal_session_manager_unregister(
-         httpd_req_to_sockfd(request)
-      );
-
-      return status;
-   }
-
-   // Release the terminal session when its WebSocket closes
-   if (frame.type == HTTPD_WS_TYPE_CLOSE)
-   {
-      terminal_session_manager_unregister(
-         httpd_req_to_sockfd(request)
-      );
-
-      return ESP_OK;
-   }
+   if (status != ESP_OK) return status;
 
    // Ignore other WebSocket control frames
    if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
@@ -1515,19 +1666,6 @@ static esp_err_t websocket_handler(httpd_req_t *request)
 
    int socket_fd = httpd_req_to_sockfd(request);
 
-   if (frame.type == HTTPD_WS_TYPE_CLOSE)
-   {
-
-      remove_admin_websocket(socket_fd);
-
-      ESP_LOGI(
-         LOG_TAG,
-         "Administrator WebSocket disconnected"
-      );
-
-      return ESP_OK;
-   }
-
    // Ignore control frames and unsupported message types
    if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
 
@@ -1584,7 +1722,19 @@ static void web_socket_close_callback(
 {
    (void)server;
 
-   terminal_session_manager_unregister(socket_fd);
+   // Record ownership before removing disconnected terminal connection
+   bool disconnecting_device_is_owner = terminal_session_manager_is_owner(socket_fd);
+
+   bool pending_requests_changed = 
+      terminal_session_manager_unregister(socket_fd);
+
+   // Notifiy remaining clients if the owning device's last connection closed
+   if (disconnecting_device_is_owner && terminal_session_manager_get_owner() < 0)
+      broadcast_terminal_ownership_changed();
+
+   // Notify the current owner when a disconnect removes pending requests
+   if (pending_requests_changed && terminal_session_manager_get_owner() >= 0)
+      broadcast_terminal_pending_requests();
 
    // If the socket is non-admin this has no effect
    remove_admin_websocket(socket_fd);
@@ -1592,6 +1742,7 @@ static void web_socket_close_callback(
    // Close the underlying socket after session cleanup
    close(socket_fd);
 }
+
 // Register one HTTP endpoint with the web server
 static esp_err_t register_uri_handler(
    const char *uri,

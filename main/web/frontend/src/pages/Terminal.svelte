@@ -19,6 +19,18 @@
    let connected = false
 
    /** @type {boolean} */
+   let isTerminalOwner = false
+
+   /** @type {boolean} */
+   let terminalOwnerPresent = false
+
+   /** @type {number[]} */
+   let pendingRequests = []
+
+   /** @type {boolean} */
+   let isRequestPending = false
+
+   /** @type {boolean} */
    let commandModeActive = false
 
    /** @type {ReturnType<typeof setInterval> | null} */
@@ -89,6 +101,104 @@
    }
 
    /**
+   * Request the current terminal ownership status.
+   * @returns {void}
+   */
+   function requestOwnershipStatus()
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'get_ownership'
+      }))
+   }
+
+   /**
+   * Request terminal control from the current owner.
+   * @returns {void}
+   */
+   function requestTerminalControl()
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'request_control'
+      }))
+   }
+
+   /**
+   * Voluntarily release terminal control.
+   * @returns {void}
+   */
+   function releaseTerminalControl()
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+      if (!isTerminalOwner) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'release_control'
+      }))
+   }
+
+   /**
+   * Grant terminal control to a requesting device.
+   * @param {number} requesterFd
+   * @returns {void}
+   */
+   function grantTerminalControl(requesterFd)
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+      if (!isTerminalOwner) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'grant_control',
+         requester_fd: requesterFd
+      }))
+   }
+
+   /**
+   * Deny a pending terminal control request.
+   * @param {number} requesterFd
+   * @returns {void}
+   */
+   function denyTerminalControl(requesterFd)
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+      if (!isTerminalOwner) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'deny_control',
+         requester_fd: requesterFd
+      }))
+   }
+
+   /**
+   * Take terminal ownership as an administrator.
+   * @returns {void}
+   */
+   function adminTakeoverTerminal()
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'admin_takeover'
+      }))
+   }
+
+   /**
+   * Update the pending terminal control requests.
+   * @param {number[]} requests
+   * @returns {void}
+   */
+   function updatePendingRequests(requests)
+   {
+      // Keep only valid, nonnegative socket descriptors
+      pendingRequests = requests.filter(
+         (requesterFd) => Number.isInteger(requesterFd) && requesterFd >= 0
+      )
+   }
+
+   /**
     * Connect to the ESP32 terminal WebSocket.
     * @returns {void}
     */
@@ -105,11 +215,54 @@
 
          // Retrieve the actual mode
          requestModeStatus()
+
+         // Retrieve terminal ownership when the WebSocket connects
+         requestOwnershipStatus()
       }
 
       terminalSocket.onmessage = (event) => {
          try {
             const response = JSON.parse(String(event.data))
+
+            // Update terminal ownership when the server reports a change
+            if (response.event === 'terminal_ownership_changed') {
+               isTerminalOwner = response.is_owner === true
+               terminalOwnerPresent = response.owner_present === true
+               isRequestPending = response.request_pending === true
+               return
+            }
+
+            // Report whether the terminal control request succeeded
+            if (response.event === 'control_request_result') {
+               if (!response.success)
+                  addHistory('error', response.error || 'Unable to request terminal control')
+               return
+            }
+
+            // Report the result of terminal ownership actions
+            if ([
+               'control_release_result',
+               'control_grant_result',
+               'control_deny_result',
+               'control_takeover_result'
+            ].includes(response.event)) {
+               if (!response.success)
+                  addHistory('error', response.error || 'Terminal control action failed')
+
+               return
+            }
+
+            // Update pending control requests received from the server
+            if (response.event === 'terminal_pending_requests') {
+               const requests = Array.isArray(response.requests)
+                  ? response.requests.map(
+                     /** @param {{ requester_fd: number }} request */
+                     (request) => request.requester_fd)
+                  : []
+
+               updatePendingRequests(requests)
+               return
+            }
 
             if (response.event === 'mode_status') {
                commandModeActive = response.success === true
@@ -145,6 +298,14 @@
       terminalSocket.onclose = () => {
          stopModeStatusPolling()
          commandModeActive = false
+
+         // Clear ownership state when the terminal connection closes
+         isTerminalOwner = false
+         terminalOwnerPresent = false
+         isRequestPending = false
+
+         // Clear pending requests when the terminal connection closes
+         pendingRequests = []
 
          connected = false
          terminalSocket = null
@@ -264,7 +425,15 @@
    <h1>LED Cube Terminal</h1>
    <p>Interactive command interface</p>
 
-   
+   {#if connected && !isTerminalOwner}
+      <button
+         type="button"
+         disabled={isRequestPending}
+         on:click={requestTerminalControl}
+      >
+         {isRequestPending ? 'Request Pending' : 'Request Control'}
+      </button>
+   {/if}
    <div class="mode-panel">
       <div class="mode-info">
          <span class="mode-indicator" class:active={commandModeActive}></span>
