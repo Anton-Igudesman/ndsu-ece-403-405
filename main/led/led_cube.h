@@ -61,3 +61,13 @@ esp_err_t led_cube_clear(void);
 
 // Display current cube frame
 esp_err_t led_cube_show(void);
+
+/*
+   Set all 512 voxels to the specified RGB color.
+   Updates the framebuffer without transmitting to the LEDs.
+*/
+esp_err_t led_cube_fill(
+   uint8_t red,
+   uint8_t green,
+   uint8_t blue
+);

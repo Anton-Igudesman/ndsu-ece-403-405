@@ -1,9 +1,12 @@
 #include "web_server.h"
 #include "client_manager.h"
+#include "web_terminal.h"
+#include "terminal_session_manager.h"
 
 #include <stdbool.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 #include "esp_http_server.h"
 #include "esp_netif_ip_addr.h"
@@ -37,6 +40,15 @@ typedef struct
    uint8_t mac[6];
 } admin_websocket_t;
 
+typedef struct
+{
+   const char *name;
+   const char *event;
+   esp_err_t (*handler)(httpd_req_t *request, const cJSON *root);
+   bool affects_ownership;
+} terminal_action_entry_t;
+
+
 // Track WebSocket connections for all currently connected administrators
 static admin_websocket_t s_admin_websockets[WEB_MAX_CLIENTS];
 
@@ -62,6 +74,232 @@ extern const uint8_t app_css_end[]
 // -----------------------------------------------------------
 // ---------------- Private Function Definitions -------------
 // -----------------------------------------------------------
+
+// ------- Forward declarations ---------
+static esp_err_t get_request_client_mac(
+   httpd_req_t *request,
+   uint8_t mac[6]
+);
+
+static esp_err_t send_websocket_json(
+   int socket_fd,
+   const cJSON *response
+);
+
+static esp_err_t notify_terminal_ownership_changed(void);
+
+// Return the current LED operating mode
+static esp_err_t handle_terminal_get_mode(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   (void)request;
+
+   return web_terminal_execute(root);
+}
+
+// Request terminal ownership for the connected client
+static esp_err_t handle_terminal_request_control(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   (void)root;
+
+   return terminal_session_manager_request_control(httpd_req_to_sockfd(request));
+}
+
+// Release ownership of the terminal
+static esp_err_t handle_terminal_release_control(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   (void)root;
+
+   return terminal_session_manager_release_control(httpd_req_to_sockfd(request));
+}
+
+// Extract and validate a terminal control requester's socket descriptor
+static esp_err_t get_terminal_requester_fd(
+   const cJSON *root,
+   int *requester_fd
+)
+{
+   if (root == NULL || requester_fd == NULL) return ESP_ERR_INVALID_ARG;
+
+   const cJSON *requester = cJSON_GetObjectItemCaseSensitive(
+      root,
+      "requester_fd"
+   );
+
+   if (!cJSON_IsNumber(requester)) return ESP_ERR_INVALID_ARG;
+
+   double value = requester->valuedouble;
+
+   // Reject negative, fractional, and out-of-range descriptors
+   if (value < 0.0 || value > INT_MAX || value != (double)(int)value) return ESP_ERR_INVALID_ARG;
+
+   *requester_fd = (int)value;
+
+   return ESP_OK;
+}
+
+// Grant terminal control to a requesting client
+static esp_err_t handle_terminal_grant_control(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   int requester_fd;
+
+   esp_err_t status = get_terminal_requester_fd(root, &requester_fd);
+   if (status != ESP_OK) return status;
+
+   return terminal_session_manager_grant_control(
+      httpd_req_to_sockfd(request),
+      requester_fd
+   );
+}
+
+// Deny a pending terminal control request
+static esp_err_t handle_terminal_deny_control(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   int requester_fd;
+   esp_err_t status = get_terminal_requester_fd(root, &requester_fd);
+   if (status != ESP_OK) return status;
+
+   return terminal_session_manager_deny_control(
+      httpd_req_to_sockfd(request),
+      requester_fd
+   );
+}
+
+// Allow an authenticated administrator to take terminal control immediately
+static esp_err_t handle_terminal_admin_takeover(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   (void)sizeof(root);
+   uint8_t client_mac[6];
+
+   esp_err_t status = get_request_client_mac(request, client_mac);
+   if (status != ESP_OK) return status;
+   
+   if (!client_manager_is_admin(client_mac)) return ESP_ERR_INVALID_STATE;
+
+   return terminal_session_manager_admin_takeover(httpd_req_to_sockfd(request));
+}
+
+// Change the LED operating mode for the current terminal owner
+static esp_err_t handle_terminal_set_mode(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+   return web_terminal_execute(root);
+}
+
+// Return the requesting terminal client's current ownership status
+static esp_err_t handle_terminal_get_ownership(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   (void)root;
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   // Report ownership relative to requesting connection
+   cJSON_AddStringToObject(response, "event", "terminal_ownership_changed");
+   cJSON_AddBoolToObject(response, "is_owner", terminal_session_manager_is_owner(socket_fd));
+   cJSON_AddBoolToObject(response, "owner_present", terminal_session_manager_get_owner() >= 0);
+
+   esp_err_t status = send_websocket_json(
+      socket_fd,
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
+}
+
+// Map terminal actions to their response events and handlers
+static const terminal_action_entry_t s_terminal_actions[] = 
+{
+   {"get_mode", "mode_status", handle_terminal_get_mode, false},
+   {"set_mode", "mode_activation_result", handle_terminal_set_mode, false},
+   {"request_control", "control_request_result", handle_terminal_request_control, true},
+   {"release_control", "control_release_result", handle_terminal_release_control, true},
+   {"grant_control", "control_grant_result", handle_terminal_grant_control, true},
+   {"deny_control", "control_deny_result", handle_terminal_deny_control, false},
+   {"admin_takeover", "control_takeover_result", handle_terminal_admin_takeover, true},
+   {"get_ownership", "terminal_ownership_status_result", handle_terminal_get_ownership, false},
+};
+
+// Resolve and execute a terminal action using the registered handlers
+static esp_err_t dispatch_terminal_action(
+   httpd_req_t *request,
+   const cJSON *root,
+   const char **event
+)
+{
+   int socket_fd = httpd_req_to_sockfd(request);
+   const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
+
+   *event = "terminal_result";
+
+   if (!cJSON_IsString(action))
+   {
+      // Pixel commands require terminal ownership
+      if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+      return web_terminal_execute(root);
+   }
+
+   const size_t action_count = sizeof(s_terminal_actions) / sizeof(s_terminal_actions[0]);
+   for (size_t i = 0; i < action_count; i++)
+   {
+      const terminal_action_entry_t *entry = &s_terminal_actions[i];
+
+      if (strcmp(action->valuestring, entry->name) != 0) continue;
+
+      *event = entry->event;
+      
+      // Capture ownership before executing actions that may transfer control
+      int previous_owner = entry->affects_ownership
+         ? terminal_session_manager_get_owner()
+         : -1;
+
+      esp_err_t status = entry->handler(request, root);
+
+      // Broadcast only when the action successfully changes terminal ownership
+      if (status == ESP_OK && entry->affects_ownership &&
+         previous_owner != terminal_session_manager_get_owner())
+      {
+         esp_err_t notify_status = notify_terminal_ownership_changed();
+
+         // Notification failures must not undo a successful ownership transfer
+         if (notify_status != ESP_OK)
+            ESP_LOGW(LOG_TAG,
+               "Terminal ownership notification failed: %s",
+               esp_err_to_name(notify_status));
+      }
+      return status;
+   }
+
+   return ESP_ERR_NOT_SUPPORTED;
+}
 
 // Parse a MAC address string into six bytes
 static esp_err_t parse_mac_address(
@@ -143,33 +381,53 @@ static esp_err_t process_admin_controller_action(const cJSON *root)
    return ESP_ERR_NOT_SUPPORTED;
 }
 
-// Send an authorization action result to the requesting administrator
-static esp_err_t send_admin_websocket_response(
+// Serialize and send a JSON object over an established WebSocket
+static esp_err_t send_websocket_json(
    int socket_fd,
+   const cJSON *response
+)
+{
+   if (s_server == NULL || socket_fd < 0 || response == NULL) return ESP_ERR_INVALID_ARG;
+
+   char *message = cJSON_PrintUnformatted(response);
+   if (message == NULL) return ESP_ERR_NO_MEM;
+
+   httpd_ws_frame_t frame = 
+   {
+      .final = true,
+      .fragmented = false,
+      .type = HTTPD_WS_TYPE_TEXT,
+      .payload = (uint8_t *)message,
+      .len = strlen(message)
+   };
+
+   esp_err_t status = httpd_ws_send_frame_async(
+      s_server,
+      socket_fd,
+      &frame
+   );
+
+   cJSON_free(message);
+   
+   return status;
+}
+
+// Send a JSON result to the requesting WebSocket client
+static esp_err_t send_websocket_response(
+   int socket_fd,
+   const char *event,
    esp_err_t action_status
 )
 {
-   if (s_server == NULL || socket_fd < 0)
-      return ESP_ERR_INVALID_STATE;
+   if (s_server == NULL || socket_fd < 0 || event == NULL) return ESP_ERR_INVALID_ARG;
 
-   // Build a JSON response indicating whether the action succeeded
    cJSON *response = cJSON_CreateObject();
-
    if (response == NULL) return ESP_ERR_NO_MEM;
 
-   cJSON_AddStringToObject(
-      response,
-      "event",
-      "controller_action_result"
-   );
+   cJSON_AddStringToObject(response, "event", event);
+   cJSON_AddBoolToObject(response, "success", action_status == ESP_OK);
 
-   cJSON_AddBoolToObject(
-      response,
-      "success",
-      action_status == ESP_OK
-   );
-
-   // Include the ESP-IDF error description when the action fails
+   // Include the ESP-IDF error description when execution fails
    if (action_status != ESP_OK)
    {
       cJSON_AddStringToObject(
@@ -179,32 +437,67 @@ static esp_err_t send_admin_websocket_response(
       );
    }
 
-   char *message = cJSON_PrintUnformatted(response);
+   esp_err_t status = send_websocket_json(
+      socket_fd,
+      response
+   );
 
    cJSON_Delete(response);
 
-   if (message == NULL) return ESP_ERR_NO_MEM;
+   return status;
+}
 
-   // Prepare the JSON text as a WebSocket frame
-   httpd_ws_frame_t frame = {
-      .final = true,
-      .fragmented = false,
-      .type = HTTPD_WS_TYPE_TEXT,
-      .payload = (uint8_t *)message,
-      .len = strlen(message)
-   };
+// Notify connected terminal when ownership changes
+static esp_err_t notify_terminal_ownership_changed(void)
+{
+   int socket_fds[TERMINAL_MAX_CLIENTS];
 
-   // Send directly to the administrator who submitted the action
-   esp_err_t status = httpd_ws_send_frame_async(
-      s_server,
-      socket_fd,
-      &frame
+   size_t client_count = terminal_session_manager_get_clients(
+      socket_fds,
+      TERMINAL_MAX_CLIENTS
    );
 
-   // The synchronous send call has completed using the payload
-   cJSON_free(message);
+   esp_err_t final_status = ESP_OK;
 
-   return status;
+   int owner_id = terminal_session_manager_get_owner();
+   for (size_t i = 0; i < client_count; i++)
+   {
+      cJSON *response = cJSON_CreateObject();
+      if (response == NULL) return ESP_ERR_NO_MEM;
+
+      // Each client receives its own ownership status
+      cJSON_AddStringToObject(response, "event", "terminal_ownership_changed");
+
+      // All connections from a device must report the same ownership state
+      bool is_owner = terminal_session_manager_is_owner(socket_fds[i]);
+
+      cJSON_AddBoolToObject(response, "is_owner", is_owner);
+      cJSON_AddBoolToObject(response, "owner_present", owner_id >= 0);
+
+      esp_err_t status = send_websocket_json(
+         socket_fds[i],
+         response
+      );
+
+      cJSON_Delete(response);
+
+      if (status != ESP_OK) final_status = status;
+   }
+
+   return final_status;
+}
+
+// Send an authorization action result to the requesting administrator
+static esp_err_t send_admin_websocket_response(
+   int socket_fd,
+   esp_err_t action_status
+)
+{
+   return send_websocket_response(
+      socket_fd,
+      "controller_action_result",
+      action_status
+   );
 }
 
 /*
@@ -1004,6 +1297,127 @@ static esp_err_t admin_clients_get_handler(httpd_req_t *request)
    return status;
 }
 
+// Receive and validate a complete WebSocket text message
+static esp_err_t receive_websocket_text(
+   httpd_req_t *request,
+   httpd_ws_frame_t *frame,
+   char *message,
+   size_t buffer_size
+)
+{
+   if (request == NULL || message == NULL || buffer_size < 2U || frame == NULL) return ESP_ERR_INVALID_ARG;
+
+   // Reject fragmented, empty, oversized, or non-text messages
+   if (frame->type != HTTPD_WS_TYPE_TEXT ||
+      frame->fragmented || !frame->final) return ESP_ERR_NOT_SUPPORTED;
+
+   if (frame->len == 0 || frame->len >= buffer_size) return ESP_ERR_INVALID_SIZE;
+
+   size_t message_length = frame->len;
+   frame->payload = (uint8_t *)message;
+
+   esp_err_t status = httpd_ws_recv_frame(request, frame, message_length);
+   if (status != ESP_OK) return status;
+
+   message[message_length] = '\0';
+
+   return ESP_OK;
+}
+
+// Handle terminal WebSocket connections from authorized controllers and admins
+static esp_err_t terminal_websocket_handler(httpd_req_t *request)
+{
+   if (request == NULL) return ESP_ERR_INVALID_ARG;
+
+   uint8_t client_mac[6];
+
+   // Identify the requesting device using the existing client registry
+   esp_err_t status = get_request_client_mac(request, client_mac);
+   if (status != ESP_OK) return status;
+
+   if (!client_manager_is_authorized(client_mac)) return ESP_ERR_INVALID_STATE;
+
+   // Register authorized terminal clients and enforce five-connection limit
+   if (request->method == HTTP_GET)
+   {
+      return terminal_session_manager_register(
+         httpd_req_to_sockfd(request),
+         client_mac
+      );
+   }
+
+   httpd_ws_frame_t frame = {0};
+
+   status = httpd_ws_recv_frame(request, &frame, 0);
+
+   if (status != ESP_OK)
+   {
+      terminal_session_manager_unregister(
+         httpd_req_to_sockfd(request)
+      );
+
+      return status;
+   }
+
+   // Release the terminal session when its WebSocket closes
+   if (frame.type == HTTPD_WS_TYPE_CLOSE)
+   {
+      terminal_session_manager_unregister(
+         httpd_req_to_sockfd(request)
+      );
+
+      return ESP_OK;
+   }
+
+   // Ignore other WebSocket control frames
+   if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
+
+   char message[513];
+
+   status = receive_websocket_text(
+      request,
+      &frame,
+      message,
+      sizeof(message)
+   );
+
+   if (status != ESP_OK) return status;
+
+   cJSON *root = cJSON_Parse(message);
+   
+   if (root == NULL)
+   {
+      // Report invalid JSON without terminating the WebSocket
+      return send_websocket_response(
+         httpd_req_to_sockfd(request),
+         "terminal_result",
+         ESP_ERR_INVALID_ARG
+      );
+   }
+
+   // Dispatch the request and select its response event
+   int socket_fd = httpd_req_to_sockfd(request);
+   const char *event = "terminal_result";
+
+   status = dispatch_terminal_action(
+      request,
+      root,
+      &event
+   );
+
+   cJSON_Delete(root);
+
+   // Ownership queries send their own response
+   if (strcmp(event, "terminal_ownership_status_result") == 0) return status;
+
+   // Return the execution result without closing the connection
+   return send_websocket_response(
+      socket_fd,
+      event,
+      status
+   );
+}
+
 /*
    Handle WebSocket connections used by authenticated administrators.
 
@@ -1117,28 +1531,16 @@ static esp_err_t websocket_handler(httpd_req_t *request)
    // Ignore control frames and unsupported message types
    if (frame.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
 
-   // Reject fragmented messages
-   if (frame.fragmented || !frame.final) return ESP_ERR_NOT_SUPPORTED;
-
-   // Limit incoming JSON messages to 512 bytes
-   if (frame.len == 0 || frame.len > 512) return ESP_ERR_INVALID_SIZE;
-
-   // Allocate extra byte for terminating null character
    char message[513];
 
-   frame.payload = (uint8_t *)message;
-
-   // Read the actual WebSocket message payload
-   esp_err_t receive_status = httpd_ws_recv_frame(
+   esp_err_t receive_status = receive_websocket_text(
       request,
       &frame,
-      512
+      message,
+      sizeof(message)
    );
-
+   
    if (receive_status != ESP_OK) return receive_status;
-
-   // Terminate the received bytes so cJSON can parse the string
-   message[frame.len] = '\0';
 
    esp_err_t process_status = process_admin_websocket_message(
       socket_fd,
@@ -1174,6 +1576,22 @@ static esp_err_t websocket_handler(httpd_req_t *request)
    return ESP_OK;
 }
 
+// Release terminal ownership and connection slots when a socket closes
+static void web_socket_close_callback(
+   httpd_handle_t server,
+   int socket_fd
+)
+{
+   (void)server;
+
+   terminal_session_manager_unregister(socket_fd);
+
+   // If the socket is non-admin this has no effect
+   remove_admin_websocket(socket_fd);
+
+   // Close the underlying socket after session cleanup
+   close(socket_fd);
+}
 // Register one HTTP endpoint with the web server
 static esp_err_t register_uri_handler(
    const char *uri,
@@ -1267,6 +1685,15 @@ static esp_err_t register_uri_handlers(void)
    );
    if (status != ESP_OK) return status;
 
+   // Register the LED terminal WebSocket endpoint
+   status = register_uri_handler(
+      "/ws/terminal",
+      HTTP_GET,
+      terminal_websocket_handler,
+      true
+   );
+   if (status != ESP_OK) return status;
+
    return ESP_OK;
 }
 
@@ -1292,7 +1719,16 @@ esp_err_t web_server_start(void)
       return status;
    }
 
+   // Initialize terminal connection and ownership tracking
+   status = terminal_session_manager_init();
+   if (status != ESP_OK) return status;
+
    httpd_config_t server_config = HTTPD_DEFAULT_CONFIG();
+
+   // Allow additional endpoints for the LED terminal
+   server_config.max_uri_handlers = 12;
+
+   server_config.close_fn = web_socket_close_callback;
 
    status = httpd_start(
       &s_server,

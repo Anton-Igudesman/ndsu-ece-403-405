@@ -39,6 +39,36 @@ esp_err_t led_cube_clear(void)
    return ESP_OK;
 }
 
+
+/*
+   Fill all cube layers with the specified RGB color.
+   Changes remain buffered until led_cube_show() is called.
+*/
+esp_err_t led_cube_fill(
+   uint8_t red,
+   uint8_t green,
+   uint8_t blue
+)
+{
+   if (!s_initialized) return ESP_ERR_INVALID_STATE;
+
+   // Update every physical pixel in each cube layer.
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   {
+      for (size_t pixel = 0; pixel < LED_CUBE_LAYER_PIXELS; pixel++)
+      {
+         s_layer_buffer[layer][pixel] = (led_cube_color_t)
+         {
+            .red = red,
+            .green = green,
+            .blue = blue
+         };
+      }
+   }
+
+   return ESP_OK;
+}
+
 esp_err_t led_cube_init(void)
 {
    s_initialized = true;

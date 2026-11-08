@@ -1,5 +1,6 @@
 
 <script>
+   import { onMount } from 'svelte'
    import { parseCubeCommand } from '../lib/cubeCommands.js'
 
    /** @type {string} */
@@ -10,6 +11,160 @@
       { type: 'system', text: 'LED Cube Terminal v0.1' },
       { type: 'system', text: 'Type help() for available commands.' }
    ]
+
+   /** @type {WebSocket | null} */
+   let terminalSocket = null
+
+   /** @type {boolean} */
+   let connected = false
+
+   /** @type {boolean} */
+   let commandModeActive = false
+
+   /** @type {ReturnType<typeof setInterval> | null} */
+   let modeStatusTimer = null
+   
+   /**
+   * Stop polling the ESP32 for Command Mode status.
+   * @returns {void}
+   */
+   function stopModeStatusPolling()
+   {
+      if (modeStatusTimer === null) return
+
+      clearInterval(modeStatusTimer)
+      modeStatusTimer = null
+   }
+
+   /**
+   * Poll until the LED controller finishes entering Command Mode.
+   * @returns {void}
+   */
+   function startModeStatusPolling()
+   {
+      stopModeStatusPolling()
+
+      // Mode transitions complete asynchronously in the LED task.
+      requestModeStatus()
+
+      modeStatusTimer = setInterval(() => {
+         if (!connected) {
+            stopModeStatusPolling()
+            return
+         }
+
+         requestModeStatus()
+      }, 250)
+   }
+
+   /**
+    * Request Command Mode activation.
+    * @returns {void}
+    */
+   function activateCommandMode()
+   {
+      if (!connected || terminalSocket?.readyState !== WebSocket.OPEN) {
+         addHistory('error', 'LED cube is not connected')
+         return
+      }
+
+      // Request a mode change through the existing terminal connection
+      terminalSocket.send(JSON.stringify({
+         action: 'set_mode',
+         mode: 'command'
+      }))
+   }
+
+   /**
+   * Request the current Command Mode status from the ESP32.
+   * @returns {void}
+   */
+   function requestModeStatus()
+   {
+      if (terminalSocket?.readyState !== WebSocket.OPEN) return
+
+      terminalSocket.send(JSON.stringify({
+         action: 'get_mode'
+      }))
+   }
+
+   /**
+    * Connect to the ESP32 terminal WebSocket.
+    * @returns {void}
+    */
+   function connectTerminal()
+   {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+      const url = `${protocol}//${window.location.host}/ws/terminal`
+
+      terminalSocket = new WebSocket(url)
+
+      terminalSocket.onopen = () => {
+         connected = true
+         addHistory('system', 'Connected to LED cube.')
+
+         // Retrieve the actual mode
+         requestModeStatus()
+      }
+
+      terminalSocket.onmessage = (event) => {
+         try {
+            const response = JSON.parse(String(event.data))
+
+            if (response.event === 'mode_status') {
+               commandModeActive = response.success === true
+               
+               // Stop polling once Command Mode becomes active
+               if (commandModeActive) stopModeStatusPolling()
+
+               return
+            }
+
+            if (response.event === 'mode_activation_result') {
+               if (response.success) {
+                  // Wait for LED controller to finish transition
+                  startModeStatusPolling()
+               } else {
+                  stopModeStatusPolling()
+                  addHistory('error', response.error || 'Mode activation failed')
+               }
+               return
+            }
+
+            if (response.event === 'terminal_result') {
+               addHistory(
+                  response.success ? 'output' : 'error',
+                  response.success ? 'OK' : (response.error || 'Command failed')
+               )
+            }
+         } catch {
+            addHistory('error', 'Invalid response from LED cube.')
+         }
+      }
+
+      terminalSocket.onclose = () => {
+         stopModeStatusPolling()
+         commandModeActive = false
+
+         connected = false
+         terminalSocket = null
+         addHistory('error', 'Disconnected from LED cube.')
+      }
+
+      terminalSocket.onerror = () => {
+         addHistory('error', 'Terminal connection error.')
+      }
+   }
+
+   onMount(() => {
+      connectTerminal()
+
+      return () => {
+         // Close the connection when leaving the terminal page.
+         stopModeStatusPolling()
+         terminalSocket?.close()
+      }
+   })
 
    /**
     * Display a message in the terminal history.
@@ -39,21 +194,30 @@
    }
 
    /**
-    * Validate and display a parsed cube command.
+    * Validate and send a cube command to ESP32
     * @param {string} input
     * @returns {void}
     */
    function processCubeCommand(input)
    {
       try {
-         // Parse and validate without sending commands to the ESP32.
+         // Validate before sending commands to the ESP32.
          const result = parseCubeCommand(input)
 
-         addHistory('output', JSON.stringify(result, null, 3))
-      } catch (error) {
-         // Report invalid commands without interrupting the terminal.
-         const message = error instanceof Error ? error.message : String(error)
+         // Keep hardware commands inactive until Command Mode is confirmed
+         if (!commandModeActive) {
+            addHistory('error', 'Activate Command Mode before sending commands')
+            return
+         }
 
+         if (!connected || terminalSocket?.readyState !== WebSocket.OPEN) {
+            addHistory('error', 'LED cube is not connected')
+            return
+         }
+
+         terminalSocket.send(JSON.stringify(result))
+      } catch (error) {
+         const message = error instanceof Error ? error.message : String(error)
          addHistory('error', message)
       }
    }
@@ -96,10 +260,38 @@
    }
 </script>
 
-
 <div class="terminal-page">
    <h1>LED Cube Terminal</h1>
    <p>Interactive command interface</p>
+
+   
+   <div class="mode-panel">
+      <div class="mode-info">
+         <span class="mode-indicator" class:active={commandModeActive}></span>
+
+         <div>
+            <strong>
+               Command Mode {commandModeActive ? 'Active' : 'Inactive'}
+            </strong>
+            <p>
+               {commandModeActive
+                  ? 'The LED cube is ready to receive commands.'
+                  : 'Activate Command Mode to control the LED cube.'}
+            </p>
+         </div>
+      </div>
+
+      {#if !commandModeActive}
+         <button
+            type="button"
+            class="activate-button"
+            disabled={!connected}
+            on:click={activateCommandMode}
+         >
+            Activate Command Mode
+         </button>
+      {/if}
+   </div>
 
    <div class="terminal">
       <div class="terminal-output">
@@ -190,4 +382,62 @@
       font-family: monospace;
       font-size: 14px;
    }
+
+   
+.mode-panel {
+   display: flex;
+   justify-content: space-between;
+   align-items: center;
+   gap: 20px;
+   padding: 18px 20px;
+   margin-bottom: 20px;
+   border: 1px solid #334155;
+   border-radius: 8px;
+   background: #1e293b;
+   color: #f8fafc;
+}
+
+.mode-info {
+   display: flex;
+   align-items: center;
+   gap: 12px;
+}
+
+.mode-info p {
+   margin: 5px 0 0;
+   color: #94a3b8;
+   font-size: 13px;
+}
+
+.mode-indicator {
+   width: 10px;
+   height: 10px;
+   flex-shrink: 0;
+   border-radius: 50%;
+   background: #ef4444;
+}
+
+.mode-indicator.active {
+   background: #22c55e;
+}
+
+.activate-button {
+   padding: 10px 16px;
+   border: none;
+   border-radius: 6px;
+   background: #2563eb;
+   color: white;
+   font-weight: 600;
+   cursor: pointer;
+}
+
+.activate-button:hover:not(:disabled) {
+   background: #1d4ed8;
+}
+
+.activate-button:disabled {
+   opacity: 0.5;
+   cursor: not-allowed;
+}
+
 </style>
