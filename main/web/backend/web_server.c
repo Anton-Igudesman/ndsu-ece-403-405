@@ -93,6 +93,129 @@ static esp_err_t notify_terminal_pending_requests(void);
 // ---------------- Private Function Definitions -------------
 // -----------------------------------------------------------
 
+// Resolve a connected device's IPv4 address from its MAC
+static esp_err_t get_client_ip_by_mac(
+   const uint8_t mac[6],
+   esp_ip4_addr_t *ip
+)
+{
+   if (mac == NULL || ip == NULL) return ESP_ERR_INVALID_ARG;
+
+   client_record_t clients[CLIENT_MANAGER_MAX_CLIENTS];
+   size_t client_count = 0;
+
+   esp_err_t status = client_manager_get_clients(
+      clients,
+      CLIENT_MANAGER_MAX_CLIENTS,
+      &client_count
+   );
+
+   if (status != ESP_OK) return status;
+
+   for (size_t i = 0; i < client_count; i++)
+   {
+      if (memcmp(clients[i].mac, mac, sizeof(clients[i].mac)) != 0)
+         continue;
+
+      *ip = clients[i].ip;
+      return ESP_OK;
+   }
+
+   return ESP_ERR_NOT_FOUND;
+}
+
+// Resolve the current terminal owner's IPv4 address
+static esp_err_t get_terminal_owner_ip(esp_ip4_addr_t *ip)
+{
+   if (ip == NULL) return ESP_ERR_INVALID_ARG;
+
+   int owner_fd = terminal_session_manager_get_owner();
+   if (owner_fd < 0) return ESP_ERR_NOT_FOUND;
+
+   uint8_t owner_mac[6];
+
+   esp_err_t status = terminal_session_manager_get_client_mac(
+      owner_fd,
+      owner_mac
+   );
+
+   if (status != ESP_OK) return status;
+
+   return get_client_ip_by_mac(owner_mac, ip);
+}
+
+// Add device and owner IP addresses, using null when unavailable
+static esp_err_t add_terminal_ip_fields(
+   cJSON *response,
+   int socket_fd
+)
+{
+   if (response == NULL) return ESP_ERR_INVALID_ARG;
+
+   uint8_t client_mac[6];
+   esp_ip4_addr_t client_ip;
+   esp_ip4_addr_t owner_ip;
+
+   char client_ip_string[16];
+   char owner_ip_string[16];
+
+   const char *client_ip_value = NULL;
+   const char *owner_ip_value = NULL;
+
+   // Resolve the receiving device's IP without blocking ownership updates
+   esp_err_t status = terminal_session_manager_get_client_mac(
+      socket_fd,
+      client_mac
+   );
+
+   if (status == ESP_OK)
+   {
+      status = get_client_ip_by_mac(client_mac, &client_ip);
+
+      if (status == ESP_OK)
+      {
+         snprintf(
+            client_ip_string,
+            sizeof(client_ip_string),
+            IPSTR,
+            IP2STR(&client_ip)
+         );
+
+         client_ip_value = client_ip_string;
+      }
+   }
+
+   // Resolve the current owner's IP when an owner exists
+   status = get_terminal_owner_ip(&owner_ip);
+
+   if (status == ESP_OK)
+   {
+      snprintf(
+         owner_ip_string,
+         sizeof(owner_ip_string),
+         IPSTR,
+         IP2STR(&owner_ip)
+      );
+
+      owner_ip_value = owner_ip_string;
+   }
+
+   // Always include both fields, even when an address is unavailable
+   cJSON *client_field = client_ip_value != NULL
+      ? cJSON_AddStringToObject(response, "client_ip", client_ip_value)
+      : cJSON_AddNullToObject(response, "client_ip");
+
+   if (client_field == NULL) return ESP_ERR_NO_MEM;
+
+   cJSON *owner_field = owner_ip_value != NULL
+      ? cJSON_AddStringToObject(response, "owner_ip", owner_ip_value)
+      : cJSON_AddNullToObject(response, "owner_ip");
+
+   if (owner_field == NULL) return ESP_ERR_NO_MEM;
+
+   return ESP_OK;
+}
+
 // Broadcast pending-request updates without affecting the original operation
 static void broadcast_terminal_pending_requests(void)
 {
@@ -376,8 +499,38 @@ static esp_err_t handle_terminal_set_mode(
 {
    int socket_fd = httpd_req_to_sockfd(request);
 
-   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
-   return web_terminal_execute(root);
+   // Log incoming mode activation requests and ownership status
+   bool is_owner = terminal_session_manager_is_owner(socket_fd);
+
+   ESP_LOGI(
+      LOG_TAG,
+      "Command Mode request: socket=%d owner=%d",
+      socket_fd,
+      is_owner
+   );
+
+   if (!is_owner)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Command Mode rejected: socket=%d is not terminal owner",
+         socket_fd
+      );
+
+      return ESP_ERR_INVALID_STATE;
+   }
+
+   // Execute the mode change and report the result
+   esp_err_t status = web_terminal_execute(root);
+
+   ESP_LOGI(
+      LOG_TAG,
+      "Command Mode result: socket=%d status=%s",
+      socket_fd,
+      esp_err_to_name(status)
+   );
+
+   return status;
 }
 
 // Return the requesting terminal client's current ownership status
@@ -403,6 +556,21 @@ static esp_err_t handle_terminal_get_ownership(
       "request_pending",
       terminal_session_manager_has_pending_request(socket_fd)
    );
+
+   // Include device identification in the initial ownership response
+   esp_err_t ip_status = add_terminal_ip_fields(
+      response,
+      socket_fd
+   );
+
+   if (ip_status != ESP_OK)
+   {
+      ESP_LOGW(
+         LOG_TAG,
+         "Unable to resolve terminal IP addresses: %s",
+         esp_err_to_name(ip_status)
+      );
+   }
 
    esp_err_t status = send_websocket_json(
       socket_fd,
@@ -642,9 +810,34 @@ static esp_err_t notify_terminal_ownership_changed(void)
       cJSON_AddBoolToObject(response, "is_owner", is_owner);
       cJSON_AddBoolToObject(response, "owner_present", owner_id >= 0);
 
+      // Include device identification in each ownership notification
+      esp_err_t ip_status = add_terminal_ip_fields(
+         response,
+         socket_fds[i]
+      );
+
+      if (ip_status != ESP_OK)
+      {
+         ESP_LOGW(
+            LOG_TAG,
+            "Unable to resolve terminal IP addresses: %s",
+            esp_err_to_name(ip_status)
+         );
+      }
+
       esp_err_t status = send_websocket_json(
          socket_fds[i],
          response
+      );
+
+      // Log ownership notification delivery for each terminal connection
+      ESP_LOGI(
+         LOG_TAG,
+         "Ownership notification: socket=%d owner=%d present=%d status=%s",
+         socket_fds[i],
+         is_owner,
+         owner_id >= 0,
+         esp_err_to_name(status)
       );
 
       cJSON_Delete(response);

@@ -3,6 +3,8 @@
 #include "esp_err.h"
 #include "led_protocol.h"
 
+#include <stdbool.h>
+
 // Initialize the LED controller with its starting mode
 esp_err_t led_controller_init(
    led_mode_t initial_mode
@@ -15,6 +17,9 @@ esp_err_t led_controller_set_mode(
 
 // Return the currently active LED mode
 led_mode_t led_controller_get_mode(void);
+
+// Report whether an LED mode transition is in progress
+bool led_controller_is_transitioning(void);
 
 // Dispatch execution to the currently active LED mode
 // Only uses bands_norm in AUDIO_EQ_MODE

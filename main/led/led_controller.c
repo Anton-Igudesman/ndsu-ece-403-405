@@ -85,6 +85,9 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
 // Return the currently active LED mode
 led_mode_t led_controller_get_mode(void) {return s_active_mode;}
 
+// Report whether an LED mode transition is in progress
+bool led_controller_is_transitioning(void) { return s_transitioning; }
+
 // Dispatch execution to currently active LED mode
 esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
 {

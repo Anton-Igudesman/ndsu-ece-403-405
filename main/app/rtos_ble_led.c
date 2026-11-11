@@ -35,7 +35,7 @@ _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 #define WEB_START_ON_BOOT 1
 #define DSP_DEBUG_LOGS 0
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
-#define LED_MATRIX_TEST_MODE 1
+#define LED_MATRIX_TEST_MODE 0
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
 #define LED_AUDIO_QUEUE_LEN 1U // Queue consists of 1 processed audio frame
@@ -180,6 +180,7 @@ static esp_err_t mic_read_and_push_samples(void)
    return ESP_OK;
 }
 
+
 static void led_task(void *arg)
 {
    (void)arg;
@@ -191,26 +192,32 @@ static void led_task(void *arg)
       (void)xQueueReceive(s_led_audio_queue, &latest_audio, 0);
 
       esp_err_t status;
+
       #if LED_MATRIX_TEST_MODE
 
-      // Test hardware - render production DSP bands on single 8x8 matrix
-      //status = led_matrix_test_render_eq(latest_audio.bands_norm);
-      status = led_matrix_test_render_eq(latest_audio.bands_norm);
-      if (status != ESP_OK) log_effect_status("led_matrix_test_render_eq", status);
+      // Process transitions and Command Mode through the LED controller
+      if (led_controller_is_transitioning() ||
+         led_controller_get_mode() == LED_MODE_COMMAND)
+         status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
+      else
+         // Continue test rendering during normal operation
+         status = led_matrix_test_render_eq(latest_audio.bands_norm);
 
-      # else
+      #else
 
-      // Abstract away LED pattern algorithms - production rendering
-      esp_err_t status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
+      // Production rendering always uses the LED controller
+      status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
 
-      if (status != ESP_OK) log_effect_status("led_controller_dispatch_active_mode", status);
+      #endif
 
-      # endif
+      if (status != ESP_OK)
+         log_effect_status("led_task", status);
 
       // Run LED mode updates every 10 ms
       vTaskDelay(pdMS_TO_TICKS(10));
    }
 }
+
 
 static void audio_publish_bands_to_led_queue(const float *bands_norm)
 {

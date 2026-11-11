@@ -1,35 +1,35 @@
 <script>
-  let username = ''
-  let password = ''
-  let errorMessage = ''
-  let loggingIn = false
+  let username = "";
+  let password = "";
+  let errorMessage = "";
+  let loggingIn = false;
 
   async function handleLogin() {
-    errorMessage = ''
-    loggingIn = true
+    errorMessage = "";
+    loggingIn = true;
 
     try {
-      const response = await fetch('/api/admin/login', {
-        method: 'POST',
+      const response = await fetch("/api/admin/login", {
+        method: "POST",
         headers: {
-          'Content-Type': 'application/json'
+          "Content-Type": "application/json",
         },
         body: JSON.stringify({
           username,
-          password
-        })
-      })
+          password,
+        }),
+      });
 
       if (!response.ok) {
-        errorMessage = 'Invalid username or password'
-        return
+        errorMessage = "Invalid username or password";
+        return;
       }
 
-      window.location.hash = '/admin/dashboard'
+      window.location.hash = "/admin/dashboard";
     } catch {
-      errorMessage = 'Unable to reach the LED Cube'
+      errorMessage = "Unable to reach the LED Cube";
     } finally {
-      loggingIn = false
+      loggingIn = false;
     }
   }
 </script>
@@ -37,23 +37,16 @@
 <main class="min-h-screen flex items-center justify-center bg-slate-950 px-6">
   <div class="w-full max-w-md">
     <div class="mb-8 text-center">
-      <h1 class="text-3xl font-bold text-white">
-        LED Cube Admin
-      </h1>
+      <h1 class="text-3xl font-bold text-white">LED Cube Admin</h1>
 
-      <p class="mt-2 text-slate-400">
-        Administrator access
-      </p>
+      <p class="mt-2 text-slate-400">Administrator access</p>
     </div>
 
     <form
       class="rounded-xl border border-slate-800 bg-slate-900 p-8"
       on:submit|preventDefault={handleLogin}
     >
-      <label
-        for="username"
-        class="block text-sm font-medium text-slate-300"
-      >
+      <label for="username" class="block text-sm font-medium text-slate-300">
         Username
       </label>
 
@@ -93,7 +86,7 @@
         disabled={loggingIn}
         class="mt-8 w-full rounded-lg bg-blue-600 px-4 py-3 font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        {loggingIn ? 'Signing in...' : 'Sign In'}
+        {loggingIn ? "Signing in..." : "Sign In"}
       </button>
     </form>
 
