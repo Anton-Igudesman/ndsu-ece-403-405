@@ -5,12 +5,14 @@
   import AdminLogin from './pages/AdminLogin.svelte'
   import AdminDashboard from './pages/AdminDashboard.svelte'
   import Terminal from './pages/Terminal.svelte'
+  import Effects from './pages/Effects.svelte'
 
   const routes = {
     '/': Home,
     '/admin': AdminLogin,
     '/admin/dashboard': AdminDashboard,
-    '/terminal': Terminal
+    '/terminal': Terminal,
+    '/effects': Effects
   }
 </script>
 
