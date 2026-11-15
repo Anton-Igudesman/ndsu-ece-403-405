@@ -44,6 +44,12 @@
   /** @type {ReturnType<typeof setInterval> | null} */
   let modeStatusTimer = null;
 
+  /** @type {string | null} */
+  let pendingMode = null;
+
+  /** @type {ReturnType<typeof setTimeout> | null} */
+  let modeAckTimer = null;
+
   /**
    * Stop polling the ESP32 for Command Mode status.
    * @returns {void}
@@ -56,11 +62,34 @@
   }
 
   /**
-   * Poll until the LED controller finishes entering Command Mode.
+   * Start a timeout while waiting for the ESP32 to acknowledge a mode change.
    * @returns {void}
    */
-  function startModeStatusPolling() {
-    stopModeStatusPolling();
+  function startModeAckTimeout() {
+    // Clear any previous acknowledgment timeout
+    clearModeAckTimeout();
+
+    modeAckTimer = setTimeout(() => {
+      modeAckTimer = null;
+      pendingMode = null;
+      addHistory("error", "LED mode change acknowledgment timed out");
+    }, 5000);
+  }
+
+  /**
+   * Poll until the LED controller reaches requested operating mode.
+   * @param {string} targetMode
+   * @returns {void}
+   */
+  function startModeStatusPolling(targetMode) {
+    stopModeStatusPolling(); // clear existing polling interval
+
+    // Track requested destination while LED task transitions
+    pendingMode = targetMode;
+
+    // Limit time spent waiting for mode transition
+    const startTime = Date.now();
+    const timeoutMs = 5000;
 
     // Mode transitions complete asynchronously in the LED task.
     requestModeStatus();
@@ -68,11 +97,32 @@
     modeStatusTimer = setInterval(() => {
       if (!connected) {
         stopModeStatusPolling();
+        pendingMode = null;
+        return;
+      }
+
+      // Stop polling if requested mode isn't confirmed within timeout period
+      if (Date.now() - startTime >= timeoutMs) {
+        stopModeStatusPolling();
+        pendingMode = null;
+        addHistory("error", "LED mode transition timed out");
+        requestModeStatus(); // Refresh mode after timeout
         return;
       }
 
       requestModeStatus();
     }, 250);
+  }
+
+  /**
+   * Cancel any outstanding mode-change acknowledgment timeout.
+   * @returns {void}
+   */
+  function clearModeAckTimeout() {
+    if (modeAckTimer === null) return;
+
+    clearTimeout(modeAckTimer);
+    modeAckTimer = null;
   }
 
   /**
@@ -85,6 +135,18 @@
       return;
     }
 
+    // Only the terminal owner can activate Command Mode
+    if (!isTerminalOwner) {
+      addHistory("error", "Terminal ownership required");
+      return;
+    }
+
+    // Track requested mode for transition confirmation
+    pendingMode = "command";
+
+    // Start acknowledgement deadline before sending request
+    startModeAckTimeout();
+
     // Request a mode change through the existing terminal connection
     terminalSocket.send(
       JSON.stringify({
@@ -93,6 +155,39 @@
       }),
     );
   }
+
+
+  /**
+   * Deactivate Command Mode and return the LED cube to Off.
+   * @returns {void}
+   */
+  function deactivateCommandMode() {
+    if (!connected || terminalSocket?.readyState !== WebSocket.OPEN) {
+      addHistory("error", "LED cube is not connected");
+      return;
+    }
+
+    // Only the current terminal owner may change the operating mode
+    if (!isTerminalOwner) {
+      addHistory("error", "Terminal ownership required");
+      return;
+    }
+
+    // Track requested mode for transition confirmation
+    pendingMode = "off";
+
+    // Start acknowledgement deadline before sending request
+    startModeAckTimeout();
+
+    // Request a transition from Command Mode to LED_MODE_OFF
+    terminalSocket.send(
+      JSON.stringify({
+        action: "set_mode",
+        mode: "off",
+      }),
+    );
+  }
+
 
   /**
    * Retrieve the current device's administrator authorization status.
@@ -315,20 +410,42 @@
         }
 
         if (response.event === "mode_status") {
-          commandModeActive = response.success === true;
+          
+          // Read operating mode reported by ESP32
+          if (!response.success) {
+            addHistory("error", response.error || "Unable to retrieve LED mode");
+            stopModeStatusPolling();
 
-          // Stop polling once Command Mode becomes active
-          if (commandModeActive) stopModeStatusPolling();
+            // Cancel any outstanding mode-change acknowledgment
+            clearModeAckTimeout();
+            pendingMode = null;
+            return;
+          }
+
+          commandModeActive = response.mode === "command";
+
+          // Stop polling once requested mode becomes active
+          if (pendingMode !== null && response.mode === pendingMode) {
+            stopModeStatusPolling();
+            pendingMode = null;
+          }
 
           return;
         }
 
         if (response.event === "mode_activation_result") {
+
+          // Acknowledgment received; cancel its timeout
+          clearModeAckTimeout();
+
           if (response.success) {
-            // Wait for LED controller to finish transition
-            startModeStatusPolling();
+            
+            // Poll until requested LED mode becomes active
+            if (pendingMode !== null) startModeStatusPolling(pendingMode);
+            else requestModeStatus(); // Refresh after a late acknowledgement
           } else {
             stopModeStatusPolling();
+            pendingMode = null;
             addHistory("error", response.error || "Mode activation failed");
           }
           return;
@@ -347,6 +464,11 @@
 
     terminalSocket.onclose = () => {
       stopModeStatusPolling();
+
+      // Cancel any outstanding mode-change acknowledgement timeout
+      clearModeAckTimeout();
+
+      pendingMode = null;
       commandModeActive = false;
 
       // Clear ownership state when the terminal connection closes
@@ -378,6 +500,10 @@
     return () => {
       // Close the connection when leaving the terminal page.
       stopModeStatusPolling();
+
+      // Cancel acknowledgement timeout when leaving terminal page
+      clearModeAckTimeout();
+  
       terminalSocket?.close();
     };
   });
@@ -584,11 +710,22 @@
       </div>
     </div>
 
-    {#if !commandModeActive}
+    {#if commandModeActive}
+      <!-- Allow the terminal owner to exit Command mode -->
       <button
         type="button"
         class="activate-button"
-        disabled={!connected || !isTerminalOwner}
+        disabled={!connected || !isTerminalOwner || pendingMode !== null}
+        onclick={deactivateCommandMode}
+      > 
+        Deactivate Command Mode
+      </button>
+    {:else}
+      <!-- Allow the terminal owner to enter COmmand Mode -->
+      <button
+        type="button"
+        class="activate-button"
+        disabled={!connected || !isTerminalOwner || pendingMode !== null}
         onclick={activateCommandMode}
       >
         Activate Command Mode

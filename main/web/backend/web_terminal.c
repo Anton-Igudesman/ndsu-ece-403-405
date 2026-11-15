@@ -6,9 +6,27 @@
 #include "led_controller.h"
 #include "led_cube.h"
 
+// Forward declarations for terminal command handlers
+static esp_err_t execute_fill(const cJSON *params);
+static esp_err_t execute_set_pixel(const cJSON *params);
+
 // ---------------------------------------
 // ----- Private Function Definitions ----
 // ---------------------------------------
+
+// Map validated terminal commands to their hardware operations
+static esp_err_t dispatch_terminal_command(
+   const char *name,
+   const cJSON *params
+)
+{
+   if (strcmp(name, "clear") == 0) return led_cube_clear();
+   if (strcmp(name, "fill") == 0) return execute_fill(params);
+   if (strcmp(name, "set_pixel") == 0) return execute_set_pixel(params);
+   if (strcmp(name, "show") == 0) return led_cube_show();
+
+   return ESP_ERR_NOT_SUPPORTED;
+}
 
 // Read an unsigned integer parameter within the specified range
 static esp_err_t get_uint_param(
@@ -81,7 +99,7 @@ static esp_err_t execute_set_pixel(const cJSON *params)
 // --- Public Function Definitions ----
 // ------------------------------------
 
-esp_err_t web_terminal_execute(const cJSON *command)
+esp_err_t web_terminal_execute(const cJSON *command, led_mode_t *active_mode)
 {
    if (!cJSON_IsObject(command)) return ESP_ERR_INVALID_ARG;
 
@@ -92,17 +110,27 @@ esp_err_t web_terminal_execute(const cJSON *command)
    {
       const cJSON *mode = cJSON_GetObjectItemCaseSensitive(command, "mode");
 
-      if (!cJSON_IsString(mode) || strcmp(mode->valuestring, "command") != 0) return ESP_ERR_INVALID_ARG;
+      if (!cJSON_IsString(mode)) return ESP_ERR_INVALID_ARG;
 
-      return led_controller_set_mode(LED_MODE_COMMAND);
+      // Enter manual terminal control
+      if (strcmp(mode->valuestring, "command") == 0)
+         return led_controller_set_mode(LED_MODE_COMMAND);
+
+      // Deactivation causes cube to go into LED_MODE_OFF
+      if (strcmp(mode->valuestring, "off") == 0)
+         return led_controller_set_mode(LED_MODE_OFF);
+
+      return ESP_ERR_INVALID_ARG;
    }
 
    // Allow the frontend to query the current operating mode
    if (cJSON_IsString(action) && strcmp(action->valuestring, "get_mode") == 0)
    {
-      return led_controller_get_mode() == LED_MODE_COMMAND
-         ? ESP_OK
-         : ESP_ERR_INVALID_STATE;
+      if (active_mode == NULL) return ESP_ERR_INVALID_ARG;
+
+      *active_mode = led_controller_get_mode();
+
+      return ESP_OK;
    }
 
    // Only execute terminal commands while Command Mode is active
@@ -113,11 +141,5 @@ esp_err_t web_terminal_execute(const cJSON *command)
 
    if (!cJSON_IsString(name) || !cJSON_IsObject(params)) return ESP_ERR_INVALID_ARG;
 
-   // Map terminal commands to hardware functions
-   if (strcmp(name->valuestring, "clear") == 0) return led_cube_clear();
-   if (strcmp(name->valuestring, "fill") == 0) return execute_fill(params);
-   if (strcmp(name->valuestring, "set_pixel") == 0) return execute_set_pixel(params);
-   if (strcmp(name->valuestring, "show") == 0) return led_cube_show();
-
-   return ESP_ERR_NOT_SUPPORTED;
+   return dispatch_terminal_command(name->valuestring, params);
 }

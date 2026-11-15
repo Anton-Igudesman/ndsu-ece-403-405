@@ -2,6 +2,7 @@
 #include "client_manager.h"
 #include "web_terminal.h"
 #include "terminal_session_manager.h"
+#include "led_controller.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -367,15 +368,49 @@ static esp_err_t execute_terminal_action(
    return status;
 }
 
-// Return the current LED operating mode
+// Return the current LED operating mode through terminal command interface
 static esp_err_t handle_terminal_get_mode(
    httpd_req_t *request,
    const cJSON *root
 )
 {
-   (void)request;
+   led_mode_t active_mode;
 
-   return web_terminal_execute(root);
+   // Validation through terminal
+   esp_err_t status = web_terminal_execute(root, &active_mode);
+   if (status != ESP_OK) return status;
+
+   const char *mode_name;
+
+   // Convert the operating mode to a frontend-readable string
+   switch (active_mode)
+   {
+      case LED_MODE_BLINK:    mode_name = "blink";    break;
+      case LED_MODE_FADE:     mode_name = "fade";     break;
+      case LED_MODE_BREATHE:  mode_name = "breathe";  break;
+      case LED_MODE_AUDIO_EQ: mode_name = "audio_eq"; break;
+      case LED_MODE_POCKETS:  mode_name = "pockets";  break;
+      case LED_MODE_OFF:      mode_name = "off";      break;
+      case LED_MODE_COMMAND:  mode_name = "command";  break;
+      default: return ESP_ERR_INVALID_STATE;
+   }
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   // Include operating mode in the status response
+   cJSON_AddStringToObject(response, "event", "mode_status");
+   cJSON_AddBoolToObject(response, "success", true);
+   cJSON_AddStringToObject(response, "mode", mode_name);
+
+   status = send_websocket_json(
+      httpd_req_to_sockfd(request),
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
 }
 
 // Broadcast ownership changes without affecting original operation
@@ -521,7 +556,7 @@ static esp_err_t handle_terminal_set_mode(
    }
 
    // Execute the mode change and report the result
-   esp_err_t status = web_terminal_execute(root);
+   esp_err_t status = web_terminal_execute(root, NULL);
 
    ESP_LOGI(
       LOG_TAG,
@@ -611,7 +646,7 @@ static esp_err_t dispatch_terminal_action(
    {
       // Pixel commands require terminal ownership
       if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
-      return web_terminal_execute(root);
+      return web_terminal_execute(root, NULL);
    }
 
    const size_t action_count = sizeof(s_terminal_actions) / sizeof(s_terminal_actions[0]);
@@ -1751,10 +1786,10 @@ static esp_err_t terminal_websocket_handler(httpd_req_t *request)
 
    cJSON_Delete(root);
 
-   // Ownership queries send their own response
-   if (strcmp(event, "terminal_ownership_status_result") == 0) return status;
+   // Handlers construct and send their own WebSocket responses
+   if (strcmp(event, "terminal_ownership_status_result") == 0 ||
+      strcmp(event, "mode_status") == 0) return status;
 
-   // Return the execution result without closing the connection
    return send_websocket_response(
       socket_fd,
       event,
