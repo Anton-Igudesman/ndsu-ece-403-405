@@ -38,8 +38,8 @@ static const char *LOG_TAG = "led_cube_rmt";
 // Four reusable RMT TX channels drive the eight physical cube layers
 static rmt_channel_handle_t s_tx_channels[LED_CUBE_RMT_CHANNEL_COUNT] = {0};
 
-// Shared encoder converts layer pixel data into WS2812 RMT symbols
-static rmt_encoder_handle_t s_ws2812_encoder = NULL;
+// Independent WS2812 encoder for each RMT TX channel
+static rmt_encoder_handle_t s_ws2812_encoders[LED_CUBE_RMT_CHANNEL_COUNT] = {0};
 
 // Store the physical data GPIO assigned to each cube layer
 static int s_layer_gpios[LED_CUBE_SIZE] = {0};
@@ -50,6 +50,9 @@ static uint8_t s_tx_buffer
    [LED_CUBE_LAYER_PIXELS * 3U] = {0};
 
 static bool s_initialized = false;
+
+// Select single-channel diagnostic or production transmission
+static bool s_single_channel_test = false;
 
 // ----------------------------------------
 // ----- Private Function Definitions -----
@@ -125,10 +128,28 @@ static esp_err_t create_ws2812_encoder(void)
       }
    };
 
-   return rmt_new_bytes_encoder(
-      &encoder_config,
-      &s_ws2812_encoder
-   );
+   // Create one independent encoder for each TX channel
+   for (size_t channel = 0; channel < LED_CUBE_RMT_CHANNEL_COUNT; channel++)
+   {
+      esp_err_t status = rmt_new_bytes_encoder(
+         &encoder_config,
+         &s_ws2812_encoders[channel]
+      );
+
+      if (status != ESP_OK)
+      {
+         // Release encoders created before failed allocation
+         for (size_t i = 0; i < channel; i++)
+         {
+            rmt_del_encoder(s_ws2812_encoders[i]);
+            s_ws2812_encoders[i] = NULL;
+         }
+
+         return status;
+      }
+   }
+
+   return ESP_OK;
 }
 
 // Enable one RMT TX channel
@@ -262,7 +283,7 @@ static esp_err_t transmit_layer(
    // Starts/queues tx - doesn't mean we are immediately safe to switch channel's GPIO after this
    return rmt_transmit(
       s_tx_channels[channel_index],
-      s_ws2812_encoder,
+      s_ws2812_encoders[channel_index],
       s_tx_buffer[layer],
       sizeof(s_tx_buffer[layer]),
       &transmit_config
@@ -322,12 +343,16 @@ static esp_err_t switch_to_batch(size_t first_layer)
 
 esp_err_t led_cube_rmt_init(
    const int *layer_gpios,
-   size_t layer_count
+   size_t layer_count,
+   bool single_channel_test
 )
 {
    if (layer_gpios == NULL) return ESP_ERR_INVALID_ARG;
    if (layer_count != LED_CUBE_SIZE) return ESP_ERR_INVALID_ARG;
    if (s_initialized) return ESP_OK;
+
+   // Store the requested RMT transmission configuration
+   s_single_channel_test = single_channel_test;
 
    // Store the physical data GPIO assigned to each cube layer
    memcpy(
@@ -380,6 +405,19 @@ esp_err_t led_cube_rmt_show(
 
    // Convert logical RGB cube state into WS2812 GRB transmission data
    prepare_tx_buffers(layer_buffer);
+
+   // Diagnostric: transmit only Layer 0 through RMT channel 0
+   if (s_single_channel_test)
+   {
+      esp_err_t status = switch_to_batch(0U);
+      if (status != ESP_OK) return status;
+
+      // TX prepared layer 0 framebuffer
+      status = transmit_layer(0U, 0U);
+      if (status != ESP_OK) return status;
+
+      return rmt_tx_wait_all_done(s_tx_channels[0], -1);
+   }
 
    // Assign channels to layers 0 through 3
    esp_err_t status = switch_to_batch(0U);
@@ -439,7 +477,7 @@ esp_err_t led_cube_rmt_test_pixel(size_t pixel_index)
 
    status = rmt_transmit(
       s_tx_channels[0],
-      s_ws2812_encoder,
+      s_ws2812_encoders[0],
       test_buffer,
       sizeof(test_buffer),
       &transmit_config
@@ -493,7 +531,7 @@ esp_err_t led_cube_rmt_test_matrix(
 
    status = rmt_transmit(
       s_tx_channels[0],
-      s_ws2812_encoder,
+      s_ws2812_encoders[0],
       test_buffer,
       sizeof(test_buffer),
       &transmit_config

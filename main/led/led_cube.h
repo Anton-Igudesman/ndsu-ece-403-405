@@ -6,6 +6,8 @@
 #include "esp_err.h"
 #include "led_cube_mapper.h"
 
+#define LED_CUBE_MAX_BRIGHTNESS 75U
+
 /*
    Renderer for the final 8x8x8 LED cube hardware.
 

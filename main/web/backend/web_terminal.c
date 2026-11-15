@@ -5,6 +5,7 @@
 
 #include "led_controller.h"
 #include "led_cube.h"
+#include "led_cube_rmt.h"
 
 // Forward declarations for terminal command handlers
 static esp_err_t execute_fill(const cJSON *params);

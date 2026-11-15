@@ -32,9 +32,15 @@ esp_err_t led_cube_map_voxel(
 
       Logical coordinates are unchanged by physical direction of the data chain
    */
-
-   if ((y % 2U) == 0U) *pixel_index_out = (y * LED_CUBE_SIZE) + x;
-   else *pixel_index_out = (y * LED_CUBE_SIZE) + (LED_CUBE_SIZE - 1U - x);
+   
+   #if LED_MATRIX_LINEAR_MAPPING
+      // Test matrix; every row progresses L -> R
+      *pixel_index_out = (y * LED_CUBE_SIZE) + x;
+   #else
+      // Production PCB; alternating serpentine rows
+      if ((y % 2U) == 0U) *pixel_index_out = (y * LED_CUBE_SIZE) + x;
+      else *pixel_index_out = (y * LED_CUBE_SIZE) + (LED_CUBE_SIZE - 1U - x);
+   #endif
 
    return ESP_OK;
 

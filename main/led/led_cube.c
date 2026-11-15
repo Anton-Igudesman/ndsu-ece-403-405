@@ -15,6 +15,14 @@ static bool s_initialized = false;
 // ----- Private Function Definitions -----
 // ----------------------------------------
 
+// Limit each RGB channel to the configured max brightness
+static uint8_t limit_brightness(uint8_t value)
+{
+   return (value > LED_CUBE_MAX_BRIGHTNESS)
+      ? LED_CUBE_MAX_BRIGHTNESS
+      : value;
+}
+
 // Clear RGB state for all pixels across all eight cube layers
 static void clear_layer_buffer(void)
 {
@@ -59,9 +67,9 @@ esp_err_t led_cube_fill(
       {
          s_layer_buffer[layer][pixel] = (led_cube_color_t)
          {
-            .red = red,
-            .green = green,
-            .blue = blue
+            .red = limit_brightness(red),
+            .green = limit_brightness(green),
+            .blue = limit_brightness(blue)
          };
       }
    }
@@ -105,9 +113,9 @@ esp_err_t led_cube_set_voxel(
    // Store voxel color in mapped layer and physical pixel position
    s_layer_buffer[layer][pixel_index] = (led_cube_color_t)
    {
-      .red = red,
-      .green = green,
-      .blue = blue
+      .red = limit_brightness(red),
+      .green = limit_brightness(green),
+      .blue = limit_brightness(blue)
    };
 
    return ESP_OK;

@@ -7,6 +7,9 @@
 #define LED_CUBE_SIZE 8U
 #define LED_CUBE_LAYER_PIXELS 64U
 
+// 1 = Linear test matrix, 0 = serpentine production PCB
+#define LED_MATRIX_LINEAR_MAPPING 1
+
 /*
    Logical cube coordinate system:
 

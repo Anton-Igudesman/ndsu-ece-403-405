@@ -2,6 +2,7 @@
 #define LED_CUBE_RMT_H
 
 #include <stddef.h>
+#include <stdbool.h>
 
 #include "esp_err.h"
 #include "led_cube.h"
@@ -11,7 +12,8 @@
 
 esp_err_t led_cube_rmt_init(
    const int *layer_gpios,
-   size_t layer_count
+   size_t layer_count,
+   bool single_channel_test
 );
 
 esp_err_t led_cube_rmt_show(

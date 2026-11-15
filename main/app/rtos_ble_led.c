@@ -36,6 +36,8 @@ _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 #define DSP_DEBUG_LOGS 0
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
 #define LED_MATRIX_TEST_MODE 0
+#define LED_EFFECT_TEST_MODE 1 // 1 = cycle through effects excluding audio EQ vis
+#define LED_RMT_SINGLE_CHANNEL_TEST 1 // 1 = Layer 0 only, 0 = production RMT
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
 #define LED_AUDIO_QUEUE_LEN 1U // Queue consists of 1 processed audio frame
@@ -195,26 +197,38 @@ static void led_task(void *arg)
 
       #if LED_MATRIX_TEST_MODE
 
-      // Process transitions and Command Mode through the LED controller
-      if (led_controller_is_transitioning() ||
-         led_controller_get_mode() == LED_MODE_COMMAND)
-         status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
-      else
-         // Continue test rendering during normal operation
-         status = led_matrix_test_render_eq(latest_audio.bands_norm);
+         // Process transitions and Command Mode through the LED controller
+         if (led_controller_is_transitioning() ||
+            led_controller_get_mode() == LED_MODE_COMMAND)
+            status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
+         else
+            // Continue test rendering during normal operation
+            // status = led_matrix_test_render_eq(latest_audio.bands_norm);
+            status = led_matrix_test_walk();
 
       #else
 
-      // Production rendering always uses the LED controller
-      status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
+         #if LED_EFFECT_TEST_MODE
+            // Advance automated effect test sequence
+            status = led_matrix_test_cycle_effects();
+            if (status != ESP_OK) log_effect_status("led_matrix_test_cycle_effects", status);
+         #endif
+
+         // Production rendering always uses the LED controller
+         status = led_controller_dispatch_active_mode(latest_audio.bands_norm);
 
       #endif
 
       if (status != ESP_OK)
          log_effect_status("led_task", status);
 
-      // Run LED mode updates every 10 ms
-      vTaskDelay(pdMS_TO_TICKS(10));
+      #if LED_MATRIX_TEST_MODE
+         // Advance on physical pixel every 500 ms
+         vTaskDelay(pdMS_TO_TICKS(500));
+      #else
+         // Run LED mode updates every 10 ms
+         vTaskDelay(pdMS_TO_TICKS(10));
+      #endif
    }
 }
 
@@ -323,7 +337,8 @@ static esp_err_t led_cube_hardware_init(void)
    // Initialize four-channel RMT driver for the eight physical layer GPIOs
    status = led_cube_rmt_init(
       s_cube_layer_gpios,
-      LED_CUBE_SIZE
+      LED_CUBE_SIZE,
+      LED_RMT_SINGLE_CHANNEL_TEST
    );
 
    if (status != ESP_OK) return status;

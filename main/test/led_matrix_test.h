@@ -6,4 +6,7 @@
 esp_err_t led_matrix_test_render_eq(const float *bands_norm);
 esp_err_t led_matrix_test_walk(void);
 
+// Cycle through programmed LED effects, excluding Audio EQ
+esp_err_t led_matrix_test_cycle_effects(void);
+
 #endif
