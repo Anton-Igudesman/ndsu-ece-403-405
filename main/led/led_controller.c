@@ -22,8 +22,11 @@ static bool s_transitioning = false;
 // Formalize the start pattern
 esp_err_t led_controller_init(led_mode_t initial_mode)
 {
-   esp_err_t status = led_controller_set_mode(initial_mode);
-
+   // Initialize default per-layer Blink settings once at startup
+   esp_err_t status = led_effects_blink_init();
+   if (status != ESP_OK) return status;
+   
+   status = led_controller_set_mode(initial_mode);
    if (status != ESP_OK) return status;
    s_initialized = true;
 
@@ -51,6 +54,12 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
    // Initial startup selects the requested mode immediately
    if (!s_initialized)
    {
+      if (mode == LED_MODE_BLINK)
+      {
+         esp_err_t status = led_effects_blink_start();
+         if (status != ESP_OK) return status;
+      }
+      
       if (mode == LED_MODE_POCKETS)
       {
          esp_err_t status = led_effect_pockets_init();

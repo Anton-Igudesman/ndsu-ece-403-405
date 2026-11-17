@@ -27,15 +27,15 @@ static uint32_t s_phase_update_count = 0U;
 static const led_cube_color_t TRANSITION_GREEN =
 {
    .red = 0U,
-   .green = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+   .green = LED_CUBE_MAX_BRIGHTNESS,
    .blue = 0U
 };
 
 static const led_cube_color_t TRANSITION_PURPLE =
 {
-   .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+   .red = LED_CUBE_MAX_BRIGHTNESS,
    .green = 0U,
-   .blue = LED_EFFECT_FILL_MAX_BRIGHTNESS
+   .blue = LED_CUBE_MAX_BRIGHTNESS
 };
 
 // ----------------------------------------

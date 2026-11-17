@@ -3,7 +3,8 @@
 #include "led_effects.h"
 #include "led_color_fade.h"
 
-#define LED_EFFECT_BLINK_UPDATES 50U
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // State machine for programmed color fade patterns
 typedef enum
@@ -39,11 +40,22 @@ static fade_state_t s_led_state;
 static led_color_t s_last_breathe_color = LED_COLOR_RED;
 static bool s_blink_on = false;
 static uint32_t s_blink_update_count = 0U;
+static uint32_t s_blink_interval_updates = 50U;
+static led_blink_config_t s_blink_layers[LED_CUBE_SIZE] = {0};
+
+// Runtime timing state for each Blink layer
+typedef struct
+{
+   TickType_t last_toggle_tick;
+   bool is_on;
+} led_blink_layer_state_t;
+
+static led_blink_layer_state_t s_blink_layer_states[LED_CUBE_SIZE] = {0};
 
 // Blink will be default red and user-configurable
 static led_cube_color_t s_blink_color =
 {
-   .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+   .red = LED_CUBE_MAX_BRIGHTNESS,
    .green = 0U,
    .blue = 0U
 };
@@ -58,16 +70,16 @@ static esp_err_t led_effects_fade_init(void)
 {
    led_cube_color_t start_color = 
    {
-      .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+      .red = LED_CUBE_MAX_BRIGHTNESS,
       .green = 0U,
       .blue = 0U
    };
 
    led_cube_color_t target_color = 
    {
-      .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+      .red = LED_CUBE_MAX_BRIGHTNESS,
       .green = 0U,
-      .blue = LED_EFFECT_FILL_MAX_BRIGHTNESS
+      .blue = LED_CUBE_MAX_BRIGHTNESS
    };
 
    esp_err_t status = led_color_fade_init(
@@ -96,6 +108,55 @@ esp_err_t led_effects_set_blink_color(led_cube_color_t color)
    return ESP_OK;
 }
 
+// Save Blink configuration for one physical layer
+esp_err_t led_effects_set_blink_layer(
+   size_t layer,
+   const led_blink_config_t *config
+)
+{
+   if (layer >= LED_CUBE_SIZE || config == NULL) return ESP_ERR_INVALID_ARG;
+   if (config->brightness_percent > 100U) return ESP_ERR_INVALID_ARG;
+   if (config->interval_ms < 200U || config->interval_ms > 1500U) return ESP_ERR_INVALID_ARG;
+
+   // Save layer settings without affecting other layers
+   s_blink_layers[layer] = *config;
+
+   return ESP_OK;
+}
+
+esp_err_t led_effects_blink_init(void)
+{
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   {
+      s_blink_layers[layer] = (led_blink_config_t)
+      {
+         .color = {255U, 0U, 0U},
+         .brightness_percent = 100U,
+         .interval_ms = 500U
+      };
+
+      // Begin each layer in the ON state
+      s_blink_layer_states[layer].last_toggle_tick = xTaskGetTickCount();
+      s_blink_layer_states[layer].is_on = true;
+   }
+
+   return ESP_OK;
+}
+
+// Restart Blink timing without changing saved layer configurations
+esp_err_t led_effects_blink_start(void)
+{
+   TickType_t now = xTaskGetTickCount();
+
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   {
+      s_blink_layer_states[layer].last_toggle_tick = now;
+      s_blink_layer_states[layer].is_on = true;
+   }
+
+   return ESP_OK;
+}
+
 // Control all 512 LED's at once
 esp_err_t led_set_solid_color(
    uint8_t red,
@@ -105,9 +166,9 @@ esp_err_t led_set_solid_color(
 {
    // Full-cube effects are capped to limit worst-case current draw
    // Limit each RGB channel for effects that can illuminate all 512 voxels
-   if (red > LED_EFFECT_FILL_MAX_BRIGHTNESS) red = LED_EFFECT_FILL_MAX_BRIGHTNESS;
-   if (green > LED_EFFECT_FILL_MAX_BRIGHTNESS) green = LED_EFFECT_FILL_MAX_BRIGHTNESS;
-   if (blue > LED_EFFECT_FILL_MAX_BRIGHTNESS) blue = LED_EFFECT_FILL_MAX_BRIGHTNESS;
+   if (red > LED_CUBE_MAX_BRIGHTNESS) red = LED_CUBE_MAX_BRIGHTNESS;
+   if (green > LED_CUBE_MAX_BRIGHTNESS) green = LED_CUBE_MAX_BRIGHTNESS;
+   if (blue > LED_CUBE_MAX_BRIGHTNESS) blue = LED_CUBE_MAX_BRIGHTNESS;
 
    for (size_t z = 0; z < LED_CUBE_SIZE; z++)
    {
@@ -218,7 +279,7 @@ esp_err_t led_effects_fade_step(void)
             next_color = (led_cube_color_t)
             {
                .red = 0U,
-               .green = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+               .green = LED_CUBE_MAX_BRIGHTNESS,
                .blue = 0U
             };
             s_current_fade_phase = FADE_PURPLE_TO_GREEN;
@@ -229,7 +290,7 @@ esp_err_t led_effects_fade_step(void)
             {
                .red = 0U,
                .green = 0U,
-               .blue = LED_EFFECT_FILL_MAX_BRIGHTNESS
+               .blue = LED_CUBE_MAX_BRIGHTNESS
             };
             s_current_fade_phase = FADE_GREEN_TO_BLUE;
             break;
@@ -237,7 +298,7 @@ esp_err_t led_effects_fade_step(void)
          case FADE_GREEN_TO_BLUE:
             next_color = (led_cube_color_t)
             {
-               .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+               .red = LED_CUBE_MAX_BRIGHTNESS,
                .green = 0U,
                .blue = 0U
             };
@@ -247,9 +308,9 @@ esp_err_t led_effects_fade_step(void)
          case FADE_BLUE_TO_RED:
             next_color = (led_cube_color_t)
             {
-               .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+               .red = LED_CUBE_MAX_BRIGHTNESS,
                .green = 0U,
-               .blue = LED_EFFECT_FILL_MAX_BRIGHTNESS
+               .blue = LED_CUBE_MAX_BRIGHTNESS
             };
             s_current_fade_phase = FADE_RED_TO_PURPLE;
             break;
@@ -280,7 +341,7 @@ esp_err_t led_effects_blink_step(void)
    s_blink_update_count++;
 
    // Hold the current state until the blink interval expires
-   if (s_blink_update_count >= LED_EFFECT_BLINK_UPDATES)
+   if (s_blink_update_count >= s_blink_interval_updates)
    {
       s_blink_on = !s_blink_on;
       s_blink_update_count = 0U;

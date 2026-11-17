@@ -27,7 +27,7 @@ static uint8_t led_effect_pockets_random_channel(void)
 {
    return random_uint8_range(
       0U,
-      LED_EFFECT_FILL_MAX_BRIGHTNESS
+      LED_CUBE_MAX_BRIGHTNESS
    );
 }
 
@@ -281,12 +281,12 @@ esp_err_t led_effect_pockets_init(void)
    {
       .red = 0,
       .green = 0,
-      .blue = LED_EFFECT_FILL_MAX_BRIGHTNESS
+      .blue = LED_CUBE_MAX_BRIGHTNESS
    };
 
    led_cube_color_t background_start = 
    {
-      .red = LED_EFFECT_FILL_MAX_BRIGHTNESS,
+      .red = LED_CUBE_MAX_BRIGHTNESS,
       .green = 0,
       .blue = 0
    };
