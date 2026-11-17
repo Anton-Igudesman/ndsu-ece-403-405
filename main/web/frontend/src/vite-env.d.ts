@@ -1,0 +1,1 @@
+declare const __LED_MAX_BRIGHTNESS__: number;
