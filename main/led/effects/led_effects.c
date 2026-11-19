@@ -5,6 +5,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 // State machine for programmed color fade patterns
 typedef enum
@@ -38,9 +39,6 @@ typedef struct
 
 static fade_state_t s_led_state;
 static led_color_t s_last_breathe_color = LED_COLOR_RED;
-static bool s_blink_on = false;
-static uint32_t s_blink_update_count = 0U;
-static uint32_t s_blink_interval_updates = 50U;
 static led_blink_config_t s_blink_layers[LED_CUBE_SIZE] = {0};
 
 // Runtime timing state for each Blink layer
@@ -52,13 +50,8 @@ typedef struct
 
 static led_blink_layer_state_t s_blink_layer_states[LED_CUBE_SIZE] = {0};
 
-// Blink will be default red and user-configurable
-static led_cube_color_t s_blink_color =
-{
-   .red = LED_CUBE_MAX_BRIGHTNESS,
-   .green = 0U,
-   .blue = 0U
-};
+// Protect shared Blink configuration and timing state
+static SemaphoreHandle_t s_blink_mutex = NULL;
 
 // Color transition state used by full-cube fade effect
 static led_color_fade_t s_fade;
@@ -101,13 +94,6 @@ static esp_err_t led_effects_fade_init(void)
    return ESP_OK;
 }
 
-// Update the color used by blink effect
-esp_err_t led_effects_set_blink_color(led_cube_color_t color)
-{
-   s_blink_color = color;
-   return ESP_OK;
-}
-
 // Save Blink configuration for one physical layer
 esp_err_t led_effects_set_blink_layer(
    size_t layer,
@@ -118,14 +104,56 @@ esp_err_t led_effects_set_blink_layer(
    if (config->brightness_percent > 100U) return ESP_ERR_INVALID_ARG;
    if (config->interval_ms < 200U || config->interval_ms > 1500U) return ESP_ERR_INVALID_ARG;
 
+   // Acquire exclusive access to shared Blink state
+   if (s_blink_mutex == NULL) return ESP_ERR_INVALID_STATE;
+
+   if (xSemaphoreTake(s_blink_mutex, portMAX_DELAY) != pdTRUE)
+      return ESP_FAIL;
+
    // Save layer settings without affecting other layers
    s_blink_layers[layer] = *config;
+
+   // Restart only the updated layer's Blink cycle
+   s_blink_layer_states[layer].last_toggle_tick = xTaskGetTickCount();
+   s_blink_layer_states[layer].is_on = true;
+
+   // Release shared Blink state after completing the update
+   xSemaphoreGive(s_blink_mutex);
+
+   return ESP_OK;
+}
+
+// Retrieve the saved configuration for one physical Blink layer
+esp_err_t led_effects_get_blink_layer(
+   size_t layer,
+   led_blink_config_t *config
+)
+{
+   if (layer >= LED_CUBE_SIZE || config == NULL) return ESP_ERR_INVALID_ARG;
+   if (s_blink_mutex == NULL) return ESP_ERR_INVALID_STATE;
+
+   // Acquire exclusive access to shared Blink configuration
+   if (xSemaphoreTake(s_blink_mutex, portMAX_DELAY) != pdTRUE)
+      return ESP_FAIL;
+
+   // Copy the requested layer configuration to the caller
+   *config = s_blink_layers[layer];
+
+   // Release the mutex after reading the configuration
+   xSemaphoreGive(s_blink_mutex);
 
    return ESP_OK;
 }
 
 esp_err_t led_effects_blink_init(void)
 {
+   // Create mutex before init of shared Blink state
+   if (s_blink_mutex == NULL)
+   {
+      s_blink_mutex = xSemaphoreCreateMutex();
+      if (s_blink_mutex == NULL) return ESP_ERR_NO_MEM;
+   }
+
    for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
    {
       s_blink_layers[layer] = (led_blink_config_t)
@@ -146,6 +174,11 @@ esp_err_t led_effects_blink_init(void)
 // Restart Blink timing without changing saved layer configurations
 esp_err_t led_effects_blink_start(void)
 {
+   if (s_blink_mutex == NULL) return ESP_ERR_INVALID_STATE;
+
+   // Acquire exclusive access to share Blink timing state
+   if (xSemaphoreTake(s_blink_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+
    TickType_t now = xTaskGetTickCount();
 
    for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
@@ -153,6 +186,9 @@ esp_err_t led_effects_blink_start(void)
       s_blink_layer_states[layer].last_toggle_tick = now;
       s_blink_layer_states[layer].is_on = true;
    }
+
+   // Release mutex after resetting layer timeers
+   xSemaphoreGive(s_blink_mutex);
 
    return ESP_OK;
 }
@@ -334,33 +370,110 @@ esp_err_t led_effects_fade_step(void)
    );
 }
 
-// Toggle full cube between on and off states
+/*
+   Scale an RGB channel proportionally to the configured brightness.
+
+   Calculation:
+      output = (channel * brightness_percent * LED_CUBE_MAX_BRIGHTNESS)
+               / (255 * 100)
+
+   - channel (0-255): Requested RGB channel intensity.
+   - brightness_percent (0-100): User-selected layer brightness.
+   - LED_CUBE_MAX_BRIGHTNESS: Maximum output intensity (currently 75).
+   - Dividing by 255 normalizes the RGB channel to a 0-1 ratio.
+   - Dividing by 100 converts the brightness percentage to a 0-1 ratio.
+   - Adding 12750 (half of 25500) rounds the integer result to nearest.
+
+   Example:
+      channel = 128, brightness = 50%, maximum = 75
+      output = round((128 * 50 * 75) / 25500) = 19
+
+   Casting to uint32_t before multiplication prevents intermediate overflow.
+*/
+static uint8_t led_blink_scale_channel(
+   uint8_t channel,
+   uint8_t brightness_percent
+)
+{
+   uint32_t scaled = (uint32_t)channel * (uint32_t)brightness_percent * LED_CUBE_MAX_BRIGHTNESS;
+
+   return (uint8_t)((scaled + 12750U) / 25500U);
+}
+
+// Render all eight Blink layers with independent timing and color settings
 esp_err_t led_effects_blink_step(void)
 {
-   // Count LED task updates to control the blink interval
-   s_blink_update_count++;
+   led_cube_color_t layer_colors[LED_CUBE_SIZE] = {0};
 
-   // Hold the current state until the blink interval expires
-   if (s_blink_update_count >= s_blink_interval_updates)
+   // Verify synchronization is initialized
+   if (s_blink_mutex == NULL) return ESP_ERR_INVALID_STATE;
+
+   // Acquire exclusive access to Blink configuration and timing state
+   if (xSemaphoreTake(s_blink_mutex, portMAX_DELAY) != pdTRUE)
+      return ESP_FAIL;
+
+   TickType_t now = xTaskGetTickCount();
+
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
    {
-      s_blink_on = !s_blink_on;
-      s_blink_update_count = 0U;
+      const led_blink_config_t *config = &s_blink_layers[layer];
+      led_blink_layer_state_t *state = &s_blink_layer_states[layer];
+
+      // Convert configured ON/OFF duration into FreeRTOS ticks
+      TickType_t interval_ticks = pdMS_TO_TICKS(config->interval_ms);
+
+      // Toggle only this layer when its interval expires
+      if ((TickType_t)(now - state->last_toggle_tick) >= interval_ticks)
+      {
+         state->is_on = !state->is_on;
+         state->last_toggle_tick = now;
+      }
+
+      // Calculate this layer's RGB output while holding the mutex
+      layer_colors[layer] = (led_cube_color_t)
+      {
+         .red = state->is_on
+            ? led_blink_scale_channel(config->color.red, config->brightness_percent)
+            : 0U,
+
+         .green = state->is_on
+            ? led_blink_scale_channel(config->color.green, config->brightness_percent)
+            : 0U,
+
+         .blue = state->is_on
+            ? led_blink_scale_channel(config->color.blue, config->brightness_percent)
+            : 0U
+      };
    }
 
-   if (s_blink_on)
+   // Configuration and timing state are no longer accessed after this point
+   xSemaphoreGive(s_blink_mutex);
+
+   // Render the locally calculated colors into the framebuffer
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
    {
-      return led_effects_set_solid_color(
-         s_blink_color.red,
-         s_blink_color.green,
-         s_blink_color.blue
-      );
+      const led_cube_color_t *color = &layer_colors[layer];
+
+      for (size_t y = 0; y < LED_CUBE_SIZE; y++)
+      {
+         for (size_t x = 0; x < LED_CUBE_SIZE; x++)
+         {
+            esp_err_t status = led_cube_set_voxel(
+               x,
+               y,
+               layer,
+               color->red,
+               color->green,
+               color->blue
+            );
+
+            if (status != ESP_OK) return status;
+         }
+      }
    }
 
-   return led_effects_set_solid_color(
-      0U,
-      0U,
-      0U
-   );
+   // Transmit the completed frame once
+   return led_cube_show();
 }
 
 esp_err_t led_effects_breathe_step(

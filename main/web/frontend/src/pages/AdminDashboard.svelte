@@ -30,8 +30,16 @@
   let errorMessage = $state("");
   let actionErrorMessage = $state("");
 
+  // Live LED controller status
+  let controlOwnerIp = $state("None");
+  let activeLedMode = $state("Unknown");
+
   /** @type {WebSocket | null} */
   let adminSocket = null;
+
+  // Read controller ownership and LED mode without changing either
+  /** @type {WebSocket | null} */
+  let statusSocket = null;
 
   async function loadClients() {
     try {
@@ -84,6 +92,42 @@
 
     adminSocket = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
+    // Connect to the existing LED controller status endpoint
+    statusSocket = new WebSocket(`${protocol}//${window.location.host}/ws/terminal`);
+
+    statusSocket.onopen = () => {
+      // Retrieve current ownership and operating mode without requesting control
+      statusSocket?.send(JSON.stringify({ action: 'get_ownership' }));
+      statusSocket?.send(JSON.stringify({ action: 'get_mode' }));
+    };
+
+    // Process live controller ownership and operating mode
+    statusSocket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+
+        // Update the current controller owner's IP address
+        if (message.event === 'terminal_ownership_changed') {
+          controlOwnerIp = message.owner_ip ?? 'None';
+        }
+
+        // Update the active LED operating mode
+        if (message.event === 'mode_status' && message.success === true) {
+          activeLedMode = message.mode;
+        }
+      } catch (error) {
+        console.error('Invalid controller status message:', error);
+      }
+    };
+
+    // Refresh controller ownership and LED mode every second
+    const statusPoll = window.setInterval(() => {
+      if (statusSocket?.readyState !== WebSocket.OPEN) return;
+
+      statusSocket.send(JSON.stringify({ action: 'get_ownership' }));
+      statusSocket.send(JSON.stringify({ action: 'get_mode' }));
+    }, 1000);
+
     adminSocket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
@@ -111,8 +155,12 @@
 
     // Close the WebSocket when the dashboard is no longer active
     return () => {
+      window.clearInterval(statusPoll);
+
       adminSocket?.close();
       adminSocket = null;
+      statusSocket?.close();
+      statusSocket = null;
     };
   });
 </script>
@@ -122,25 +170,38 @@
     <div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
       <div>
         <h1 class="text-2xl font-bold">LED Cube Admin</h1>
-
         <p class="mt-1 text-sm text-slate-400">Access Point Client Monitor</p>
-      </div>
 
-      <div class="flex items-center gap-3">
-        <!-- Navigate to the terminal without changing administrator authorization -->
-        <a
-          href="#/terminal"
-          class="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-500"
-        >
-          Open Terminal
-        </a>
+        <!-- Display current access point and LED controller status -->
+        <div class="flex items-center gap-8 text-right">
+          <div>
+            <p class="text-xs font-medium text-slate-400">
+              Connected Clients
+            </p>
+            <p class="mt-1 text-xl font-semibold text-white">
+              {clients.length} / 8
+            </p>
+          </div>
 
-        <a
-          href="#/"
-          class="rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-800"
-        >
-          Exit Admin
-        </a>
+          <div>
+            <p class="text-xs font-medium text-slate-400">
+              Control Owner
+            </p>
+            <p class="mt-1 text-lg font-semibold text-white">
+              {controlOwnerIp}
+            </p>
+          </div>
+          
+
+          <div>
+            <p class="text-xs font-medium text-slate-400">
+              LED Mode
+            </p>
+            <p class="mt-1 text-lg font-semibold text-white">
+              {activeLedMode}
+            </p>
+          </div>
+        </div>
       </div>
     </div>
   </header>

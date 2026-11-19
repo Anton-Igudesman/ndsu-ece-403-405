@@ -59,7 +59,7 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
          esp_err_t status = led_effects_blink_start();
          if (status != ESP_OK) return status;
       }
-      
+
       if (mode == LED_MODE_POCKETS)
       {
          esp_err_t status = led_effect_pockets_init();
@@ -115,6 +115,13 @@ esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
       if (!transition_complete) return ESP_OK;
 
       // Transition finished - initialize the pending mode if required
+
+      if (s_pending_mode == LED_MODE_BLINK)
+      {
+         status = led_effects_blink_start();
+         if (status != ESP_OK) return status;
+      }
+
       if (s_pending_mode == LED_MODE_POCKETS)
       {
          status = led_effect_pockets_init();

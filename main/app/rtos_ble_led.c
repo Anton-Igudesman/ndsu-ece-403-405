@@ -36,8 +36,8 @@ _Static_assert(AUDIO_FRAME_SIZE == FFT_FRAME_SIZE,
 #define DSP_DEBUG_LOGS 0
 #define MIC_DEBUG_MONITOR 0 // 1 enables debug mode for mic input
 #define LED_MATRIX_TEST_MODE 0
-#define LED_EFFECT_TEST_MODE 1 // 1 = cycle through effects excluding audio EQ vis
-#define LED_RMT_SINGLE_CHANNEL_TEST 1 // 1 = Layer 0 only, 0 = production RMT
+#define LED_EFFECT_TEST_MODE 0 // 1 = cycle through effects excluding audio EQ vis
+#define LED_RMT_SINGLE_CHANNEL_TEST 0 // 1 = Layer 0 only, 0 = production RMT
 #define GPIO4_SCOPE_TEST_MODE 0 // Set to 1 to run GPIO4 scope test only
 #define GPIO4_SCOPE_TEST_STEADY_HIGH 1 // 1 = steady HIGH, 0 = 1 Hz square wave
 #define LED_AUDIO_QUEUE_LEN 1U // Queue consists of 1 processed audio frame

@@ -3,6 +3,7 @@
 #include "web_terminal.h"
 #include "terminal_session_manager.h"
 #include "led_controller.h"
+#include "effects/led_effects.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -89,6 +90,28 @@ static void broadcast_terminal_pending_requests(void);
 
 // Notify the owning device of the current pending control requests
 static esp_err_t notify_terminal_pending_requests(void);
+
+// Save an individual Blink layer through the existing WebSocket
+static esp_err_t handle_blink_save_layer(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
+static esp_err_t handle_blink_activate(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
+static esp_err_t handle_blink_deactivate(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
+// Retrieve one Blink layer's saved configuration through WebSocket
+static esp_err_t handle_blink_get_layer(
+   httpd_req_t *request,
+   const cJSON *root
+);
 
 // -----------------------------------------------------------
 // ---------------- Private Function Definitions -------------
@@ -403,6 +426,13 @@ static esp_err_t handle_terminal_get_mode(
    cJSON_AddBoolToObject(response, "success", true);
    cJSON_AddStringToObject(response, "mode", mode_name);
 
+   // Report whether and LED mode transition is underway
+   cJSON_AddBoolToObject(
+      response,
+      "transitioning",
+      led_controller_is_transitioning()
+   );
+
    status = send_websocket_json(
       httpd_req_to_sockfd(request),
       response
@@ -526,6 +556,182 @@ static esp_err_t handle_terminal_admin_takeover(
    return terminal_session_manager_admin_takeover(httpd_req_to_sockfd(request));
 }
 
+// Read and validate an unsigned integer from a WebSocket JSON command
+static esp_err_t get_web_uint_param(
+   const cJSON *root,
+   const char *name,
+   uint32_t max_value,
+   uint32_t *value
+)
+{
+   if (root == NULL || name == NULL || value == NULL)
+      return ESP_ERR_INVALID_ARG;
+
+   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+
+   if (!cJSON_IsNumber(item)) return ESP_ERR_INVALID_ARG;
+
+   double number = item->valuedouble;
+
+   // Reject negative, fractional, or out-of-range values
+   if (number < 0.0 ||
+      number > max_value ||
+      number != (double)(uint32_t)number)
+      return ESP_ERR_INVALID_ARG;
+
+   *value = (uint32_t)number;
+
+   return ESP_OK;
+}
+
+// Save one Blink layer using the existing terminal ownership permissions
+static esp_err_t handle_blink_save_layer(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   // Only the current terminal owner may modify LED effects
+   if (!terminal_session_manager_is_owner(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   uint32_t layer;
+   uint32_t red;
+   uint32_t green;
+   uint32_t blue;
+   uint32_t brightness;
+   uint32_t interval_ms;
+
+   // Validate all configuration fields before changing Blink state
+   if (get_web_uint_param(root, "layer", LED_CUBE_SIZE - 1U, &layer) != ESP_OK ||
+      get_web_uint_param(root, "r", 255U, &red) != ESP_OK ||
+      get_web_uint_param(root, "g", 255U, &green) != ESP_OK ||
+      get_web_uint_param(root, "b", 255U, &blue) != ESP_OK ||
+      get_web_uint_param(root, "brightness", 100U, &brightness) != ESP_OK ||
+      get_web_uint_param(root, "interval_ms", 1500U, &interval_ms) != ESP_OK)
+      return ESP_ERR_INVALID_ARG;
+
+   led_blink_config_t config =
+   {
+      .color =
+      {
+         .red = (uint8_t)red,
+         .green = (uint8_t)green,
+         .blue = (uint8_t)blue
+      },
+      .brightness_percent = (uint8_t)brightness,
+      .interval_ms = interval_ms
+   };
+
+   // Save the validated configuration for the selected physical layer
+   esp_err_t status = led_effects_set_blink_layer((size_t)layer, &config);
+   if (status != ESP_OK) return status;
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   // Identify the saved layer so the frontend can match the acknowledgment
+   cJSON_AddStringToObject(response, "event", "blink_save_result");
+   cJSON_AddBoolToObject(response, "success", true);
+   cJSON_AddNumberToObject(response, "layer", layer);
+
+   status = send_websocket_json(
+      socket_fd,
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
+}
+
+// Activate Blink using the saved configurations for all eight layers
+static esp_err_t handle_blink_activate(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   // Only the current terminal owner may activate LED effects
+   if (!terminal_session_manager_is_owner(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   // Request Blink through the existing LED controller
+   return led_controller_set_mode(LED_MODE_BLINK);
+}
+
+// Deactivate Blink through the existing LED controller
+static esp_err_t handle_blink_deactivate(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   // Only the current terminal owner may deactivate LED effects
+   if (!terminal_session_manager_is_owner(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   // Only deactivate when Blink is the active mode
+   if (led_controller_is_transitioning() ||
+      led_controller_get_mode() != LED_MODE_BLINK)
+      return ESP_ERR_INVALID_STATE;
+
+   // Request Off without modifying saved Blink configurations
+   return led_controller_set_mode(LED_MODE_OFF);
+}
+
+// Retrieve one Blink layer's saved configuration through WebSocket
+static esp_err_t handle_blink_get_layer(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   uint32_t layer;
+
+   // Validate the requested physical layer
+   if (get_web_uint_param(root, "layer", LED_CUBE_SIZE - 1U, &layer) != ESP_OK)
+      return ESP_ERR_INVALID_ARG;
+
+   led_blink_config_t config;
+
+   // Read the configuration without modifying Blink state
+   esp_err_t status = led_effects_get_blink_layer((size_t)layer, &config);
+   if (status != ESP_OK) return status;
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   // Return the selected layer's saved configuration
+   cJSON_AddStringToObject(response, "event", "blink_layer_config");
+   cJSON_AddBoolToObject(response, "success", true);
+   cJSON_AddNumberToObject(response, "layer", layer);
+   cJSON_AddNumberToObject(response, "r", config.color.red);
+   cJSON_AddNumberToObject(response, "g", config.color.green);
+   cJSON_AddNumberToObject(response, "b", config.color.blue);
+   cJSON_AddNumberToObject(response, "brightness", config.brightness_percent);
+   cJSON_AddNumberToObject(response, "interval_ms", config.interval_ms);
+
+   status = send_websocket_json(
+      httpd_req_to_sockfd(request),
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
+}
+
 // Change the LED operating mode for the current terminal owner
 static esp_err_t handle_terminal_set_mode(
    httpd_req_t *request,
@@ -622,6 +828,10 @@ static const terminal_action_entry_t s_terminal_actions[] =
 {
    {"get_mode", "mode_status", handle_terminal_get_mode, false, false},
    {"set_mode", "mode_activation_result", handle_terminal_set_mode, false, false},
+   {"blink_save_layer", "blink_save_result", handle_blink_save_layer, false, false},
+   {"blink_activate", "blink_activation_result", handle_blink_activate, false, false},
+   {"blink_deactivate", "blink_deactivation_result", handle_blink_deactivate, false, false},
+   {"blink_get_layer", "blink_layer_config", handle_blink_get_layer, false, false},
    {"request_control", "control_request_result", handle_terminal_request_control, true, true},
    {"release_control", "control_release_result", handle_terminal_release_control, true, true},
    {"grant_control", "control_grant_result", handle_terminal_grant_control, true, true},
@@ -1787,8 +1997,11 @@ static esp_err_t terminal_websocket_handler(httpd_req_t *request)
    cJSON_Delete(root);
 
    // Handlers construct and send their own WebSocket responses
-   if (strcmp(event, "terminal_ownership_status_result") == 0 ||
-      strcmp(event, "mode_status") == 0) return status;
+   if (status == ESP_OK && 
+      (strcmp(event, "terminal_ownership_status_result") == 0 ||
+      strcmp(event, "mode_status") == 0 ||
+      strcmp(event, "blink_layer_config") == 0 ||
+      strcmp(event, "blink_save_result") == 0)) return status;
 
    return send_websocket_response(
       socket_fd,

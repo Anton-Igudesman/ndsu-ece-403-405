@@ -1,4 +1,6 @@
 <script>
+  import { onMount } from 'svelte';
+
   /** @typedef {'Blink' | 'Fade' | 'Breathe' | 'Pockets'} EffectTab */
 
   /** @type {EffectTab} */
@@ -6,6 +8,341 @@
 
   /** @type {EffectTab[]} */
   const effects = ['Blink', 'Fade', 'Breathe', 'Pockets'];
+
+  // Effects Dashboard WebSocket connection and ownership state
+  /** @type {WebSocket | null} */
+  let effectsSocket = null;
+
+  let effectsConnected = false;
+  let isEffectsOwner = false;
+  let effectsOwnerPresent = false;
+  let isEffectsAdmin = false;
+
+  // Track whether this client has requested LED control
+  let effectsControlPending = false;
+
+  // Feedback from controller ownership operations
+  let effectsControlStatus = '';
+
+  // Current LED operating mode reported by the ESP32
+  let activeLedMode = 'unknown';
+
+  // Track whether the ESP32 is transitioning between LED modes
+  let effectsTransitioning = false;
+
+  // Feedback from ESP32 after saving a layer
+  let blinkSaveStatus = '';
+
+  // Track whether a Blink configuration save is awaiting acknowledgment
+  let blinkSavePending = false;
+
+  // Identify the layer awaiting a Save acknowledgment
+  /** @type {number | null} */
+  let blinkPendingLayer = null;
+
+  // Prevent overlapping Blink mode requests
+  let blinkModePending = false;
+
+  // Track which Blink layers have loaded their configurations from the ESP32
+  /** @type {boolean[]} */
+  let blinkLayersLoaded = Array(8).fill(false);
+
+  // Connect to the ESP32's existing terminal WebSocket
+  function connectEffectsSocket() {
+    // Determine whether this device can take control as an administrator
+    async function refreshEffectsAdminStatus() {
+      try {
+        const response = await fetch('/api/controller/status', {
+          cache: 'no-store'
+        });
+
+        if (!response.ok) {
+          isEffectsAdmin = false;
+          return;
+        }
+
+        const data = await response.json();
+        isEffectsAdmin = data.auth_state === 3;
+      } catch (error) {
+        console.error('Unable to retrieve Effects administrator status:', error);
+        isEffectsAdmin = false;
+      }
+    }
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = `${protocol}//${window.location.host}/ws/terminal`;
+
+    effectsSocket = new WebSocket(url);
+
+    effectsSocket.onopen = () => {
+      // Require fresh configuration readback for this connection
+      refreshEffectsAdminStatus();
+      blinkLayersLoaded = Array(8).fill(false);
+      effectsConnected = true;
+
+      // Retrieve current controller mode and ownership status
+      effectsSocket?.send(JSON.stringify({ action: 'get_mode' }));
+      effectsSocket?.send(JSON.stringify({ action: 'get_ownership' }));
+
+      // Retrieve the saved configuration for all eight physical layers
+      for (const layer of blinkLayers) {
+        effectsSocket?.send(JSON.stringify({
+          action: 'blink_get_layer',
+          layer
+        }));
+      }
+    };
+
+    // Process controller mode and ownership updates
+    effectsSocket.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+
+        if (message.event === 'terminal_ownership_changed' ||
+            message.event === 'terminal_ownership_status_result') {
+              isEffectsOwner = message.is_owner === true;
+              effectsOwnerPresent = message.owner_present === true;
+              effectsControlPending = message.request_pending === true;
+            }
+
+        // Handle control request and release acknowledgments
+        if (message.event === 'control_request_result' ||
+            message.event === 'control_release_result' ||
+            message.event === 'control_takeover_result') {
+          if (message.success !== true) {
+            console.error('LED control operation failed:', message.error);
+            effectsControlStatus = `Control operation failed: ${message.error ?? 'Unknown error'}`;
+          } else effectsControlStatus = '';
+
+          // Refresh ownership state after the operation
+          effectsSocket?.send(JSON.stringify({ action: 'get_ownership' }));
+        }
+
+        // Track the active LED mode and ongoing transitions
+        if (message.event === 'mode_status' && message.success === true) {
+          activeLedMode = message.mode;
+          effectsTransitioning = message.transitioning === true;
+          if (!effectsTransitioning) blinkModePending = false;
+        }
+
+        // Process Blink activation and deactivation acknowledgments
+        if (message.event === 'blink_activation_result' ||
+            message.event === 'blink_deactivation_result') {
+          if (message.success !== true) {
+            blinkModePending = false;
+            console.error('Blink mode change failed:', message.error);
+          }
+
+          // Refresh controller state after the request
+          effectsSocket?.send(JSON.stringify({ action: 'get_mode' }));
+        }
+
+        // Process the ESP32's Blink configuration save result
+        if (message.event === 'blink_save_result') {
+          const savedLayer = blinkPendingLayer;
+          blinkSavePending = false;
+          blinkPendingLayer = null;
+
+          if (message.success === true && message.layer === savedLayer) {
+            blinkSaveStatus = `Layer ${savedLayer} settings saved successfully`;
+          } else {
+            blinkSaveStatus = `Save failed: ${message.error ?? 'Unexpected layer acknowledgment'}`;
+            console.error('Blink save failed:', message);
+          }
+        }
+
+        // Load saved Blink configurations returned by the ESP32
+        if (message.event === 'blink_layer_config' && message.success === true) {
+          const layer = message.layer;
+
+          if (Number.isInteger(layer) && layer >= 0 && layer < blinkConfigs.length) {
+            blinkConfigs[layer] = {
+              red: message.r,
+              green: message.g,
+              blue: message.b,
+              brightness: message.brightness,
+              interval: message.interval_ms
+            };
+
+            // Mark this layer ready after receiving its firmware configuration
+            blinkLayersLoaded[layer] = true;
+            blinkLayersLoaded = [...blinkLayersLoaded];
+
+            // Update sliders only if this is the selected layer
+            if (layer === activeBlinkLayer) {
+              blinkRed = message.r;
+              blinkGreen = message.g;
+              blinkBlue = message.b;
+              blinkBrightness = message.brightness;
+              blinkInterval = message.interval_ms;
+            }
+          }
+        }
+      } catch (error) {
+        console.error('Invalid Effects WebSocket message:', error);
+      }
+    };
+
+    effectsSocket.onclose = () => {
+      effectsConnected = false;
+      isEffectsOwner = false;
+      effectsOwnerPresent = false;
+      effectsControlPending = false;
+      effectsTransitioning = false;
+      activeLedMode = 'unknown';
+
+      // Discard pending operations and stale firmware configuration state
+      blinkSavePending = false;
+      blinkPendingLayer = null;
+      blinkModePending = false;
+      blinkLayersLoaded = Array(8).fill(false);
+      blinkSaveStatus = '';
+      effectsControlStatus = '';
+    };
+  }
+
+  // Open the Effects WebSocket when the page loads and close it when leaving
+  onMount(() => {
+    connectEffectsSocket();
+
+    // Keep the dashboard synchronized with ESP32 mode changes
+    const modePoll = window.setInterval(() => {
+      if (effectsSocket?.readyState === WebSocket.OPEN) {
+        effectsSocket.send(JSON.stringify({ action: 'get_mode' }));
+      }
+    }, 500);
+
+    return () => {
+      window.clearInterval(modePoll);
+      effectsSocket?.close();
+      effectsSocket = null;
+    };
+  });
+
+  // Physical LED cube layer currently being configured
+  let activeBlinkLayer = 0;
+
+  // Available physical layers (Z = 0 through 7)
+  const blinkLayers = Array.from({ length: 8 }, (_, index) => index);
+
+  /**
+   * Configuration for one physical Blink layer.
+   * @typedef {Object} BlinkLayerConfig
+   * @property {number} red - RGB red channel (0-255)
+   * @property {number} green - RGB green channel (0-255)
+   * @property {number} blue - RGB blue channel (0-255)
+   * @property {number} brightness - Brightness percentage (0-100)
+   * @property {number} interval - ON/OFF duration in milliseconds
+   */
+
+  // Independent settings for each physical Blink layer
+  /** @type {BlinkLayerConfig[]} */
+  let blinkConfigs = Array.from({ length: 8 }, () => ({
+    red: 255,
+    green: 0,
+    blue: 0,
+    brightness: 100,
+    interval: 500
+  }));
+  
+  // Load the selected layer's configuration into the sliders
+  /** @param {number} layer */
+  function selectBlinkLayer(layer) {
+
+    const config = blinkConfigs[layer];
+
+    if (!config) return;
+
+    // Preserve the current layer's edits before switching
+    blinkConfigs[activeBlinkLayer] = {
+      red: blinkRed,
+      green: blinkGreen,
+      blue: blinkBlue,
+      brightness: blinkBrightness,
+      interval: blinkInterval
+    };
+
+    activeBlinkLayer = layer;
+    blinkRed = config.red;
+    blinkGreen = config.green;
+    blinkBlue = config.blue;
+    blinkBrightness = config.brightness;
+    blinkInterval = config.interval;
+  }
+
+  // Capture the selected layer's current slider settings
+  function getCurrentBlinkConfig() {
+    return {
+      red: blinkRed,
+      green: blinkGreen,
+      blue: blinkBlue,
+      brightness: blinkBrightness,
+      interval: blinkInterval
+    };
+  }
+
+  // Send the selected Blink layer configuration to the ESP32
+  function saveBlinkLayer() {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
+      return;
+
+    if (!isEffectsOwner)
+      return;
+
+    // Prevent another Save while awaiting the ESP32's response
+    if (blinkSavePending)
+      return;
+
+    const config = getCurrentBlinkConfig();
+
+    // Mark the Save operation as pending before transmitting
+    blinkSavePending = true;
+    blinkPendingLayer = activeBlinkLayer;
+    blinkSaveStatus = '';
+
+    effectsSocket.send(JSON.stringify({
+      action: 'blink_save_layer',
+      layer: activeBlinkLayer,
+      r: config.red,
+      g: config.green,
+      b: config.blue,
+      brightness: config.brightness,
+      interval_ms: config.interval
+    }));
+  }
+
+  // Activate or deactivate Blink based on the ESP32's reported mode
+  function toggleBlink() {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
+      return;
+
+    if (!isEffectsOwner || effectsTransitioning || blinkModePending)
+      return;
+
+    const action = activeLedMode === 'blink'
+      ? 'blink_deactivate'
+      : 'blink_activate';
+
+    blinkModePending = true;
+
+    effectsSocket.send(JSON.stringify({ action }));
+  }
+
+  // Request or release LED control through the existing Terminal WebSocket
+  function toggleEffectsControl() {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
+      return;
+
+    if (effectsControlPending)
+      return;
+
+    const action = isEffectsOwner
+      ? 'release_control'
+      : isEffectsAdmin
+        ? 'admin_takeover'
+        : 'request_control';
+
+    effectsSocket.send(JSON.stringify({ action }));
+  }
 
   // Blink RGB color ratios
   let blinkRed = 255;
@@ -47,6 +384,28 @@
       Select and configure LED cube effects.
     </p>
     
+    <!-- Request or release control of the LED cube -->
+    <button
+      type="button"
+      onclick={toggleEffectsControl}
+      disabled={!effectsConnected || effectsControlPending}
+      class="mt-6 w-full rounded-lg bg-slate-700 px-6 py-3 font-semibold text-white hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {isEffectsOwner
+        ? 'Release Control'
+        : effectsControlPending
+          ? 'Control Request Pending'
+          : isEffectsAdmin
+            ? 'Take Control'
+            : 'Request Control'}
+    </button>
+
+    <!-- Display controller ownership errors -->
+    {#if effectsControlStatus}
+      <p class="mt-3 text-center text-sm text-red-400">
+        {effectsControlStatus}
+      </p>
+    {/if}
     <div class="mt-10 grid grid-cols-4 gap-2">
       {#each effects as effect}
           <button
@@ -73,6 +432,23 @@
     </p>
     {#if activeTab === 'Blink'}
 
+      <!-- Select the physical Blink layer to configure -->
+      <div class="mt-6 grid grid-cols-4 gap-2">
+        {#each blinkLayers as layer}
+            <button
+              type="button"
+              onclick={() => selectBlinkLayer(layer)}
+              class={`rounded-lg px-3 py-2 text-sm font-semibold text-white transition-colors ${
+                  activeBlinkLayer === layer
+                    ? 'bg-blue-600'
+                    : 'bg-slate-800 hover:bg-slate-700'
+              }`}
+            >
+              Layer {layer}
+            </button>
+        {/each}
+      </div>
+
       <!-- Live preview of the calculated LED color -->
       <div class="mt-6">
         <div class="flex items-center justify-between">
@@ -98,6 +474,7 @@
 
         <input
             id="blink-red"
+            disabled={!blinkLayersLoaded[activeBlinkLayer]}
             type="range"
             min="0"
             max="255"
@@ -115,6 +492,7 @@
 
         <input
             id="blink-green"
+            disabled={!blinkLayersLoaded[activeBlinkLayer]}
             type="range"
             min="0"
             max="255"
@@ -132,6 +510,7 @@
 
         <input
             id="blink-blue"
+            disabled={!blinkLayersLoaded[activeBlinkLayer]}
             type="range"
             min="0"
             max="255"
@@ -149,6 +528,7 @@
 
         <input
             id="blink-brightness"
+            disabled={!blinkLayersLoaded[activeBlinkLayer]}
             type="range"
             min="0"
             max="100"
@@ -164,19 +544,47 @@
 
         <input
             id="blink-interval"
+            disabled={!blinkLayersLoaded[activeBlinkLayer]}
             type="range"
-            min="100"
-            max="2000"
+            min="200"
+            max="1500"
             step="50"
             bind:value={blinkInterval}
             class="mt-3 w-full cursor-pointer accent-blue-600"
         />
       </div>
+
+      <!-- Save the selected layer's configuration -->
       <button
         type="button"
-        class="mt-8 w-full rounded-lg bg-blue-600 px-6 py-3 font-semibold text-white hover:bg-blue-500"
+        disabled={!effectsConnected || 
+                  !isEffectsOwner || 
+                  !blinkLayersLoaded[activeBlinkLayer] || 
+                  blinkSavePending}
+        onclick={saveBlinkLayer}
+        class="mt-8 w-full rounded-lg bg-green-600 px-6 py-3 font-semibold text-white hover:bg-green-500 disabled:cursor-not-allowed disabled:opacity-50"
       >
-        Activate Blink
+        Save Layer {activeBlinkLayer}
+      </button>
+
+      <!-- Display the ESP32's configuration save result -->
+      {#if blinkSaveStatus}
+        <p class="mt-3 text-center text-sm text-slate-300">
+          {blinkSaveStatus}
+        </p>
+      {/if}
+
+      <button
+        type="button"
+        onclick={toggleBlink}
+        disabled={!effectsConnected || 
+                !isEffectsOwner || 
+                activeLedMode === 'unknown' || 
+                effectsTransitioning ||
+                blinkModePending}
+        class="mt-8 w-full rounded-lg bg-blue-600 px-6 py-3 font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+      >
+        {activeLedMode === 'blink' ? 'Deactivate Blink' : 'Activate Blink'}
       </button>
     {/if}
   </div>

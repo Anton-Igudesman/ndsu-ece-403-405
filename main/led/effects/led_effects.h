@@ -16,6 +16,15 @@ typedef struct
    uint32_t interval_ms;
 } led_blink_config_t;
 
+// Independent Fade configuration for one physical cube layer
+typedef struct
+{
+   led_cube_color_t colors[3];
+   uint8_t color_count;
+   uint8_t brightness_percent;
+   uint32_t transition_ms;
+} led_fade_config_t;
+
 // Enum state for basic RGB color levels 
 typedef enum
 {
@@ -64,18 +73,34 @@ esp_err_t led_effects_set_solid_color(
    uint8_t blue
 );
 
-esp_err_t led_effects_set_blink_color(led_cube_color_t color);
-esp_err_t led_effects_set_blink_interval(uint32_t interval_ms);
-
 // Configure Blink independently for one physical cube layer
 esp_err_t led_effects_set_blink_layer(
    size_t layer,
    const led_blink_config_t *config
 );
 
+// Retrieve the saved Blink configuration for one physical layer
+esp_err_t led_effects_get_blink_layer(
+   size_t layer,
+   led_blink_config_t *config
+);
+
 esp_err_t led_effects_blink_init(void);
 esp_err_t led_effects_blink_start(void);
 esp_err_t led_effects_blink_step(void);
+
+esp_err_t led_effects_set_fade_layer(
+   size_t layer,
+   const led_fade_config_t *config
+);
+
+esp_err_t led_effects_get_fade_layer(
+   size_t layer,
+   led_fade_config_t *config
+);
+
+esp_err_t led_effects_fade_init(void);
+esp_err_t led_effects_fade_start(void);
 esp_err_t led_effects_fade_step(void);
 
 esp_err_t led_effects_breathe_step(

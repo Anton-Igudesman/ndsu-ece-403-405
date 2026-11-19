@@ -6,6 +6,7 @@
   import AdminDashboard from './pages/AdminDashboard.svelte'
   import Terminal from './pages/Terminal.svelte'
   import Effects from './pages/Effects.svelte'
+  import Navbar from './components/Navbar.svelte'
 
   const routes = {
     '/': Home,
@@ -16,4 +17,5 @@
   }
 </script>
 
+<Navbar />
 <Router {routes} />
