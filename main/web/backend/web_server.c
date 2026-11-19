@@ -113,6 +113,30 @@ static esp_err_t handle_blink_get_layer(
    const cJSON *root
 );
 
+// Save the configuration for one physical Fade layer
+static esp_err_t handle_fade_save_layer(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
+// Retrieve the saved configuration for one physical Fade layer
+static esp_err_t handle_fade_get_layer(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
+// Activate Fade using the saved layer configurations
+static esp_err_t handle_fade_activate(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
+// Deactivate Fade through the existing LED controller
+static esp_err_t handle_fade_deactivate(
+   httpd_req_t *request,
+   const cJSON *root
+);
+
 // -----------------------------------------------------------
 // ---------------- Private Function Definitions -------------
 // -----------------------------------------------------------
@@ -584,6 +608,38 @@ static esp_err_t get_web_uint_param(
    return ESP_OK;
 }
 
+// Read and validate an RGB color from a WebSocket JSON object
+static esp_err_t get_web_rgb_color(
+   const cJSON *root,
+   const char *name,
+   led_cube_color_t *color
+)
+{
+   if (root == NULL || name == NULL || color == NULL)
+      return ESP_ERR_INVALID_ARG;
+
+   const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, name);
+   if (!cJSON_IsObject(item)) return ESP_ERR_INVALID_ARG;
+
+   uint32_t red;
+   uint32_t green;
+   uint32_t blue;
+
+   if (get_web_uint_param(item, "r", 255U, &red) != ESP_OK ||
+      get_web_uint_param(item, "g", 255U, &green) != ESP_OK ||
+      get_web_uint_param(item, "b", 255U, &blue) != ESP_OK)
+      return ESP_ERR_INVALID_ARG;
+
+   *color = (led_cube_color_t)
+   {
+      .red = (uint8_t)red,
+      .green = (uint8_t)green,
+      .blue = (uint8_t)blue
+   };
+
+   return ESP_OK;
+}
+
 // Save one Blink layer using the existing terminal ownership permissions
 static esp_err_t handle_blink_save_layer(
    httpd_req_t *request,
@@ -732,6 +788,175 @@ static esp_err_t handle_blink_get_layer(
    return status;
 }
 
+// Save one Fade layer using the existing terminal ownership permissions
+static esp_err_t handle_fade_save_layer(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   // Only the current terminal owner may modify LED effects
+   if (!terminal_session_manager_is_owner(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   uint32_t layer;
+   uint32_t color_count;
+   uint32_t brightness;
+   uint32_t transition_steps;
+
+   // Validate configuration before modifying Fade state
+   if (get_web_uint_param(root, "layer", LED_CUBE_SIZE - 1U, &layer) != ESP_OK ||
+      get_web_uint_param(root, "color_count", 3U, &color_count) != ESP_OK ||
+      get_web_uint_param(root, "brightness", 100U, &brightness) != ESP_OK ||
+      get_web_uint_param(root, "transition_steps", 500U, &transition_steps) != ESP_OK)
+      return ESP_ERR_INVALID_ARG;
+
+   // Fade requires two or three colors and 100-500 transition steps
+   if (color_count < 2U || transition_steps < 100U ||
+      transition_steps % 50U != 0U)
+      return ESP_ERR_INVALID_ARG;
+
+   led_fade_config_t config = {0};
+
+   config.color_count = (uint8_t)color_count;
+   config.brightness_percent = (uint8_t)brightness;
+   config.transition_steps = transition_steps;
+
+   // Read all three colors, including the inactive third color
+   if (get_web_rgb_color(root, "color1", &config.colors[0]) != ESP_OK ||
+      get_web_rgb_color(root, "color2", &config.colors[1]) != ESP_OK ||
+      get_web_rgb_color(root, "color3", &config.colors[2]) != ESP_OK)
+      return ESP_ERR_INVALID_ARG;
+
+   // Save only the selected physical layer
+   esp_err_t status = led_effects_set_fade_layer(
+      (size_t)layer,
+      &config
+   );
+
+   if (status != ESP_OK) return status;
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   // Identify the saved layer in the acknowledgment
+   cJSON_AddStringToObject(response, "event", "fade_save_result");
+   cJSON_AddBoolToObject(response, "success", true);
+   cJSON_AddNumberToObject(response, "layer", layer);
+
+   status = send_websocket_json(
+      socket_fd,
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
+}
+
+// Retrieve one Fade layer's saved configuration through WebSocket
+static esp_err_t handle_fade_get_layer(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   uint32_t layer;
+
+   // Validate the requested physical layer
+   if (get_web_uint_param(root, "layer", LED_CUBE_SIZE - 1U, &layer) != ESP_OK)
+      return ESP_ERR_INVALID_ARG;
+
+   led_fade_config_t config;
+
+   // Retrieve the saved configuration without modifying Fade state
+   esp_err_t status = led_effects_get_fade_layer((size_t)layer, &config);
+   if (status != ESP_OK) return status;
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   // Return all three colors, including an inactive third color
+   cJSON_AddStringToObject(response, "event", "fade_layer_config");
+   cJSON_AddBoolToObject(response, "success", true);
+   cJSON_AddNumberToObject(response, "layer", layer);
+   cJSON_AddNumberToObject(response, "color_count", config.color_count);
+   cJSON_AddNumberToObject(response, "brightness", config.brightness_percent);
+   cJSON_AddNumberToObject(response, "transition_steps", config.transition_steps);
+
+   for (size_t index = 0; index < 3U; index++)
+   {
+      char name[8];
+      snprintf(name, sizeof(name), "color%u", (unsigned)(index + 1U));
+
+      cJSON *color = cJSON_CreateObject();
+      if (color == NULL)
+      {
+         cJSON_Delete(response);
+         return ESP_ERR_NO_MEM;
+      }
+
+      cJSON_AddNumberToObject(color, "r", config.colors[index].red);
+      cJSON_AddNumberToObject(color, "g", config.colors[index].green);
+      cJSON_AddNumberToObject(color, "b", config.colors[index].blue);
+      cJSON_AddItemToObject(response, name, color);
+   }
+
+   status = send_websocket_json(
+      httpd_req_to_sockfd(request),
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
+}
+
+// Activate Fade using the saved configurations for all eight layers
+static esp_err_t handle_fade_activate(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   // Only the current terminal owner may activate LED effects
+   if (!terminal_session_manager_is_owner(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   // Request Fade through the existing LED controller
+   return led_controller_set_mode(LED_MODE_FADE);
+}
+
+// Deactivate Fade through the existing LED controller
+static esp_err_t handle_fade_deactivate(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+
+   // Only the current terminal owner may deactivate LED effects
+   if (!terminal_session_manager_is_owner(socket_fd))
+      return ESP_ERR_INVALID_STATE;
+
+   // Only deactivate when Fade is the active mode
+   if (led_controller_is_transitioning() ||
+      led_controller_get_mode() != LED_MODE_FADE)
+      return ESP_ERR_INVALID_STATE;
+
+   // Request Off without modifying saved Fade configurations
+   return led_controller_set_mode(LED_MODE_OFF);
+}
+
 // Change the LED operating mode for the current terminal owner
 static esp_err_t handle_terminal_set_mode(
    httpd_req_t *request,
@@ -838,6 +1063,10 @@ static const terminal_action_entry_t s_terminal_actions[] =
    {"deny_control", "control_deny_result", handle_terminal_deny_control, false, true},
    {"admin_takeover", "control_takeover_result", handle_terminal_admin_takeover, true, true},
    {"get_ownership", "terminal_ownership_status_result", handle_terminal_get_ownership, false, false},
+   {"fade_save_layer", "fade_save_result", handle_fade_save_layer, false, false},
+   {"fade_get_layer", "fade_layer_config", handle_fade_get_layer, false, false},
+   {"fade_activate", "fade_activation_result", handle_fade_activate, false, false},
+   {"fade_deactivate", "fade_deactivation_result", handle_fade_deactivate, false, false},
 };
 
 // Resolve and execute a terminal action using the registered handlers
@@ -2001,7 +2230,9 @@ static esp_err_t terminal_websocket_handler(httpd_req_t *request)
       (strcmp(event, "terminal_ownership_status_result") == 0 ||
       strcmp(event, "mode_status") == 0 ||
       strcmp(event, "blink_layer_config") == 0 ||
-      strcmp(event, "blink_save_result") == 0)) return status;
+      strcmp(event, "blink_save_result") == 0 ||
+      strcmp(event, "fade_layer_config") == 0 ||
+      strcmp(event, "fade_save_result") == 0)) return status;
 
    return send_websocket_response(
       socket_fd,

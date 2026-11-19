@@ -22,7 +22,7 @@ typedef struct
    led_cube_color_t colors[3];
    uint8_t color_count;
    uint8_t brightness_percent;
-   uint32_t transition_ms;
+   uint32_t transition_steps;
 } led_fade_config_t;
 
 // Enum state for basic RGB color levels 

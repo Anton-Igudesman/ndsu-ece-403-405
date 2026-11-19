@@ -33,6 +33,13 @@ typedef struct
    fade_phase_t phase; // while pattern
 } fade_state_t;
 
+// ---- Forward declarations
+// Shared proportional RGB brightness scaling for Blink and Fade
+static uint8_t led_blink_scale_channel(
+   uint8_t channel,
+   uint8_t brightness_percent
+);
+
 // -------------------------------------
 // ----- Module Scope Definitions ------
 // -------------------------------------
@@ -53,45 +60,151 @@ static led_blink_layer_state_t s_blink_layer_states[LED_CUBE_SIZE] = {0};
 // Protect shared Blink configuration and timing state
 static SemaphoreHandle_t s_blink_mutex = NULL;
 
-// Color transition state used by full-cube fade effect
-static led_color_fade_t s_fade;
-static bool s_fade_initialized = false;
-static fade_phase_t s_current_fade_phase = FADE_RED_TO_PURPLE;
+// Saved Fade configuration for each physical cube layer
+static led_fade_config_t s_fade_layers[LED_CUBE_SIZE] = {0};
+
+// Runtime interpolation and timing state for each Fade layer
+typedef struct
+{
+   led_color_fade_t fade;
+   uint8_t target_color_index;
+} led_fade_layer_state_t;
+
+static led_fade_layer_state_t s_fade_layer_states[LED_CUBE_SIZE] = {0};
+static SemaphoreHandle_t s_fade_mutex = NULL;
 
 // Initialize full-cube fade with starting color and first target
-static esp_err_t led_effects_fade_init(void)
+esp_err_t led_effects_fade_init(void)
 {
-   led_cube_color_t start_color = 
+   if (s_fade_mutex == NULL)
    {
-      .red = LED_CUBE_MAX_BRIGHTNESS,
-      .green = 0U,
-      .blue = 0U
-   };
+      s_fade_mutex = xSemaphoreCreateMutex();
+      if (s_fade_mutex == NULL) return ESP_ERR_NO_MEM;
+   }
 
-   led_cube_color_t target_color = 
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
    {
-      .red = LED_CUBE_MAX_BRIGHTNESS,
-      .green = 0U,
-      .blue = LED_CUBE_MAX_BRIGHTNESS
-   };
+      // Default to a three-color RGB sequence
+      s_fade_layers[layer] = (led_fade_config_t)
+      {
+         .colors = 
+         {
+            {255U, 0U, 0U},
+            {0U, 255U, 0U},
+            {0U, 0U, 255U}
+         },
+         .color_count = 3U,
+         .brightness_percent = 100U,
+         .transition_steps = LED_EFFECT_FADE_TRANSITION_STEPS
+      };
 
-   esp_err_t status = led_color_fade_init(
-      &s_fade,
-      start_color,
-      LED_EFFECT_FADE_TRANSITION_STEPS
-   );
-   if (status != ESP_OK) return status;
+      // Begin each layer at 1st color
+      led_fade_layer_state_t *state = &s_fade_layer_states[layer];
 
-   status = led_color_fade_set_target(
-      &s_fade,
-      target_color
-   );
-   if (status != ESP_OK) return status;
+      esp_err_t status = led_color_fade_init(
+         &state->fade,
+         s_fade_layers[layer].colors[0],
+         s_fade_layers[layer].transition_steps
+      );
+      if (status != ESP_OK) return status;
 
-   s_current_fade_phase = FADE_RED_TO_PURPLE;
-   s_fade_initialized = true;
+      status = led_color_fade_set_target(
+         &state->fade,
+         s_fade_layers[layer].colors[1]
+      );
+      if (status != ESP_OK) return status;
+
+      state->target_color_index = 1U;
+   }
 
    return ESP_OK;
+}
+
+// Save Fade configuration for one physical layer
+esp_err_t led_effects_set_fade_layer(
+   size_t layer,
+   const led_fade_config_t *config
+)
+{
+   if (layer >= LED_CUBE_SIZE || config == NULL) return ESP_ERR_INVALID_ARG;
+   if (config->color_count < 2U || config->color_count > 3U) return ESP_ERR_INVALID_ARG;
+   if (config->brightness_percent > 100U) return ESP_ERR_INVALID_ARG;
+   if (config->transition_steps == 0U) return ESP_ERR_INVALID_ARG;
+
+   if (s_fade_mutex == NULL) return ESP_ERR_INVALID_STATE;
+   if (xSemaphoreTake(s_fade_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+
+   // Save only the selected layer configuration
+   s_fade_layers[layer] = *config;
+
+   led_fade_layer_state_t *state = &s_fade_layer_states[layer];
+
+   esp_err_t status = led_color_fade_init(
+      &state->fade,
+      config->colors[0],
+      config->transition_steps
+   );
+
+   if (status == ESP_OK) status = led_color_fade_set_target(&state->fade, config->colors[1]);
+   if (status == ESP_OK) state->target_color_index = 1U;
+
+   xSemaphoreGive(s_fade_mutex);
+
+   return status;
+}
+
+// Retrieve the saved Fade configuration for one physical layer
+esp_err_t led_effects_get_fade_layer(
+   size_t layer,
+   led_fade_config_t *config
+)
+{
+   if (layer >= LED_CUBE_SIZE || config == NULL) return ESP_ERR_INVALID_ARG;
+   if (s_fade_mutex == NULL) return ESP_ERR_INVALID_STATE;
+
+   if (xSemaphoreTake(s_fade_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+
+   *config = s_fade_layers[layer];
+   xSemaphoreGive(s_fade_mutex);
+
+   return ESP_OK;
+}
+
+// Restart Fade timing without modifying saved layer configurations
+esp_err_t led_effects_fade_start(void)
+{
+   if (s_fade_mutex == NULL) return ESP_ERR_INVALID_STATE;
+   if (xSemaphoreTake(s_fade_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+
+   esp_err_t status = ESP_OK;
+
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   {
+      led_fade_layer_state_t *state = &s_fade_layer_states[layer];
+      const led_fade_config_t *config = &s_fade_layers[layer];
+
+      // Restart at color 1, transitioning toward color 2
+      status = led_color_fade_init(
+         &state->fade,
+         config->colors[0],
+         config->transition_steps
+      );
+
+      if (status != ESP_OK) break;
+
+      status = led_color_fade_set_target(
+         &state->fade,
+         config->colors[1]
+      );
+
+      if (status != ESP_OK) break;
+
+      state->target_color_index = 1U;
+   }
+
+   xSemaphoreGive(s_fade_mutex);
+
+   return status;
 }
 
 // Save Blink configuration for one physical layer
@@ -293,81 +406,82 @@ esp_err_t led_effects_set_solid_color(
 
 esp_err_t led_effects_fade_step(void)
 {
+   led_cube_color_t layer_colors[LED_CUBE_SIZE] = {0};
 
-   if (!s_fade_initialized)
+   if (s_fade_mutex == NULL) return ESP_ERR_INVALID_STATE;
+
+   // Protect configuration and interpolation state during calculations
+   if (xSemaphoreTake(s_fade_mutex, portMAX_DELAY) != pdTRUE) return ESP_FAIL;
+   
+   esp_err_t status = ESP_OK;
+
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
    {
-      esp_err_t status = led_effects_fade_init();
-      if (status != ESP_OK) return status;
-   }
+      const led_fade_config_t *config = &s_fade_layers[layer];
+      led_fade_layer_state_t *state = &s_fade_layer_states[layer];
 
-   // Advance current RGB transition
-   esp_err_t status = led_color_fade_step(&s_fade);
-   if (status != ESP_OK) return status;
+      // Advance this layer toward its current target color
+      status = led_color_fade_step(&state->fade);
+      if (status != ESP_OK) break;
 
-   // Select next transition after reaching the current target
-   if (led_color_fade_is_complete(&s_fade))
-   {
-      led_cube_color_t next_color;
-
-      switch (s_current_fade_phase)
+      // Start the next transition when the current color is reached
+      if (led_color_fade_is_complete(&state->fade))
       {
-         case FADE_RED_TO_PURPLE:
-            next_color = (led_cube_color_t)
-            {
-               .red = 0U,
-               .green = LED_CUBE_MAX_BRIGHTNESS,
-               .blue = 0U
-            };
-            s_current_fade_phase = FADE_PURPLE_TO_GREEN;
-            break;
+         uint8_t next_index = (uint8_t)((state->target_color_index + 1U) % config->color_count);
+         status = led_color_fade_set_target(&state->fade, config->colors[next_index]);
 
-         case FADE_PURPLE_TO_GREEN:
-            next_color = (led_cube_color_t)
-            {
-               .red = 0U,
-               .green = 0U,
-               .blue = LED_CUBE_MAX_BRIGHTNESS
-            };
-            s_current_fade_phase = FADE_GREEN_TO_BLUE;
-            break;
-
-         case FADE_GREEN_TO_BLUE:
-            next_color = (led_cube_color_t)
-            {
-               .red = LED_CUBE_MAX_BRIGHTNESS,
-               .green = 0U,
-               .blue = 0U
-            };
-            s_current_fade_phase = FADE_BLUE_TO_RED;
-            break;
-
-         case FADE_BLUE_TO_RED:
-            next_color = (led_cube_color_t)
-            {
-               .red = LED_CUBE_MAX_BRIGHTNESS,
-               .green = 0U,
-               .blue = LED_CUBE_MAX_BRIGHTNESS
-            };
-            s_current_fade_phase = FADE_RED_TO_PURPLE;
-            break;
-
-         default:
-            return ESP_ERR_INVALID_STATE;
+         if (status != ESP_OK) break;
+         state->target_color_index = next_index;
       }
 
-      status = led_color_fade_set_target(
-         &s_fade,
-         next_color
-      );
-      if (status != ESP_OK) return status;
+      // Scale the interpolated RGB color to configured brightness
+      layer_colors[layer] = (led_cube_color_t)
+      {
+         .red = led_blink_scale_channel(
+            state->fade.current_color.red,
+            config->brightness_percent
+         ),
+         .green = led_blink_scale_channel(
+            state->fade.current_color.green,
+            config->brightness_percent
+         ),
+         .blue = led_blink_scale_channel(
+            state->fade.current_color.blue,
+            config->brightness_percent
+         )
+      }; 
    }
 
-   // Apply the current fade color to the complete cube
-   return led_effects_set_solid_color(
-      s_fade.current_color.red,
-      s_fade.current_color.green,
-      s_fade.current_color.blue
-   );
+   // Release shared state before updating LED framebuffer
+   xSemaphoreGive(s_fade_mutex);
+
+   if (status != ESP_OK) return status;
+
+   // Render each layer using independently calculated color
+   for (size_t layer = 0; layer < LED_CUBE_SIZE; layer++)
+   {
+      const led_cube_color_t *color = &layer_colors[layer];
+
+      for (size_t y = 0; y < LED_CUBE_SIZE; y++)
+      {
+         for (size_t x = 0; x < LED_CUBE_SIZE; x++)
+         {
+            status = led_cube_set_voxel(
+               x,
+               y,
+               layer,
+               color->red,
+               color->green,
+               color->blue
+            );
+
+            if (status != ESP_OK) return status;
+         }
+      }
+   }
+
+   // Transmit the completed framebuffer once
+   return led_cube_show();
 }
 
 /*

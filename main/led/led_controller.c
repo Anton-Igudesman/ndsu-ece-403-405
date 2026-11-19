@@ -26,6 +26,9 @@ esp_err_t led_controller_init(led_mode_t initial_mode)
    esp_err_t status = led_effects_blink_init();
    if (status != ESP_OK) return status;
    
+   status = led_effects_fade_init();
+   if (status != ESP_OK) return status;
+
    status = led_controller_set_mode(initial_mode);
    if (status != ESP_OK) return status;
    s_initialized = true;
@@ -57,6 +60,12 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
       if (mode == LED_MODE_BLINK)
       {
          esp_err_t status = led_effects_blink_start();
+         if (status != ESP_OK) return status;
+      }
+
+      if (mode == LED_MODE_FADE)
+      {
+         esp_err_t status = led_effects_fade_start();
          if (status != ESP_OK) return status;
       }
 
@@ -109,16 +118,20 @@ esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
       esp_err_t status = led_effect_transition_step(
          &transition_complete
       );
-
       if (status != ESP_OK) return status;
 
       if (!transition_complete) return ESP_OK;
 
       // Transition finished - initialize the pending mode if required
-
       if (s_pending_mode == LED_MODE_BLINK)
       {
          status = led_effects_blink_start();
+         if (status != ESP_OK) return status;
+      }
+
+      if (s_pending_mode == LED_MODE_FADE)
+      {
+         status = led_effects_fade_start();
          if (status != ESP_OK) return status;
       }
 

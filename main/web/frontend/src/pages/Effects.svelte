@@ -90,6 +90,14 @@
           layer
         }));
       }
+
+      // Retrieve the saved Fade configuration for all eight physical layers
+      for (const layer of blinkLayers) {
+        effectsSocket?.send(JSON.stringify({
+          action: 'fade_get_layer',
+          layer
+        }));
+      }
     };
 
     // Process controller mode and ownership updates
@@ -150,6 +158,53 @@
           }
         }
 
+        // Process the ESP32's Fade configuration save result
+        if (message.event === 'fade_save_result') {
+          const savedLayer = fadePendingLayer;
+
+          fadeSavePending = false;
+          fadePendingLayer = null;
+
+          if (message.success === true && message.layer === savedLayer) {
+            fadeSaveStatus = `Layer ${savedLayer} settings saved successfully`;
+          } else {
+            fadeSaveStatus = `Save failed: ${message.error ?? 'Unexpected layer acknowledgment'}`;
+            console.error('Fade save failed:', message);
+          }
+        }
+
+        // Process Fade activation and deactivation acknowledgments
+        if (message.event === 'fade_activation_result' ||
+            message.event === 'fade_deactivation_result') {
+          if (message.success !== true) {
+            console.error('Fade mode change failed:', message.error);
+          }
+
+          // Refresh the controller's actual operating mode
+          effectsSocket?.send(JSON.stringify({ action: 'get_mode' }));
+        }
+
+        // Load saved Fade configurations returned by the ESP32
+        if (message.event === 'fade_layer_config' && message.success === true) {
+          const layer = message.layer;
+
+          if (Number.isInteger(layer) && layer >= 0 && layer < fadeConfigs.length) {
+            fadeConfigs[layer] = {
+              colors: [
+                rgbToHex(message.color1),
+                rgbToHex(message.color2),
+                rgbToHex(message.color3)
+              ],
+              colorCount: message.color_count,
+              brightness: message.brightness,
+              transitionSteps: message.transition_steps
+            };
+
+            // Notify Svelte that the selected layer configuration changed
+            fadeConfigs = [...fadeConfigs];
+          }
+        }
+
         // Load saved Blink configurations returned by the ESP32
         if (message.event === 'blink_layer_config' && message.success === true) {
           const layer = message.layer;
@@ -196,6 +251,9 @@
       blinkModePending = false;
       blinkLayersLoaded = Array(8).fill(false);
       blinkSaveStatus = '';
+      fadeSavePending = false;
+      fadePendingLayer = null;
+      fadeSaveStatus = '';
       effectsControlStatus = '';
     };
   }
@@ -234,6 +292,15 @@
    * @property {number} interval - ON/OFF duration in milliseconds
    */
 
+  /**
+   * Configuration for one physical Fade layer.
+   * @typedef {Object} FadeLayerConfig
+   * @property {string[]} colors - Three RGB colors stored as hexadecimal strings
+   * @property {number} colorCount - Number of active colors (2 or 3)
+   * @property {number} brightness - Brightness percentage (0-100)
+   * @property {number} transitionSteps - Number of interpolation steps per color
+   */
+
   // Independent settings for each physical Blink layer
   /** @type {BlinkLayerConfig[]} */
   let blinkConfigs = Array.from({ length: 8 }, () => ({
@@ -243,6 +310,26 @@
     brightness: 100,
     interval: 500
   }));
+
+  // Independent Fade settings for all eight physical layers
+  /** @type {FadeLayerConfig[]} */
+  let fadeConfigs = Array.from({ length: 8 }, () => ({
+    colors: ['#ff0000', '#00ff00', '#0000ff'],
+    colorCount: 3,
+    brightness: 100,
+    transitionSteps: 200
+  }));
+
+  // Physical Fade layer currently being configured
+  let activeFadeLayer = 0;
+
+  // Track Fade configuration saves and their acknowledgments
+  let fadeSavePending = false;
+
+  /** @type {number | null} */
+  let fadePendingLayer = null;
+
+  let fadeSaveStatus = '';
   
   // Load the selected layer's configuration into the sliders
   /** @param {number} layer */
@@ -310,6 +397,60 @@
     }));
   }
 
+  /**
+   * Convert a hexadecimal color into RGB channels.
+   * @param {string} hex
+   * @returns {{ r: number, g: number, b: number }}
+   */
+  function hexToRgb(hex) {
+    return {
+      r: parseInt(hex.slice(1, 3), 16),
+      g: parseInt(hex.slice(3, 5), 16),
+      b: parseInt(hex.slice(5, 7), 16)
+    };
+  }
+
+  /**
+   * Convert RGB channels from the ESP32 into a color-picker value.
+   * @param {{ r: number, g: number, b: number }} color
+   * @returns {string}
+   */
+  function rgbToHex(color) {
+    return '#' + [color.r, color.g, color.b]
+      .map(channel => channel.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  // Save the selected Fade layer configuration to the ESP32
+  function saveFadeLayer() {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
+      return;
+
+    if (!isEffectsOwner || fadeSavePending)
+      return;
+
+    const config = fadeConfigs[activeFadeLayer];
+    if (!config) return;
+
+    // Convert all three colors, including an inactive third color
+    const colors = config.colors.map(hexToRgb);
+
+    fadeSavePending = true;
+    fadePendingLayer = activeFadeLayer;
+    fadeSaveStatus = '';
+
+    effectsSocket.send(JSON.stringify({
+      action: 'fade_save_layer',
+      layer: activeFadeLayer,
+      color_count: config.colorCount,
+      color1: colors[0],
+      color2: colors[1],
+      color3: colors[2],
+      brightness: config.brightness,
+      transition_steps: config.transitionSteps
+    }));
+  }
+
   // Activate or deactivate Blink based on the ESP32's reported mode
   function toggleBlink() {
     if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
@@ -323,6 +464,21 @@
       : 'blink_activate';
 
     blinkModePending = true;
+
+    effectsSocket.send(JSON.stringify({ action }));
+  }
+
+  // Activate or deactivate Fade using the existing LED controller
+  function toggleFade() {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
+      return;
+
+    if (!isEffectsOwner || effectsTransitioning)
+      return;
+
+    const action = activeLedMode === 'fade'
+      ? 'fade_deactivate'
+      : 'fade_activate';
 
     effectsSocket.send(JSON.stringify({ action }));
   }
@@ -586,7 +742,160 @@
       >
         {activeLedMode === 'blink' ? 'Deactivate Blink' : 'Activate Blink'}
       </button>
+    {:else if activeTab === 'Fade'}
+
+    <!-- Select the physical Fade layer to configure -->
+    <div class="mt-6 grid grid-cols-4 gap-2">
+      {#each blinkLayers as layer}
+        <button
+          type="button"
+          onclick={() => activeFadeLayer = layer}
+          class={`rounded-lg px-3 py-2 text-sm font-semibold text-white transition-colors ${
+            activeFadeLayer === layer
+              ? 'bg-blue-600'
+              : 'bg-slate-800 hover:bg-slate-700'
+          }`}
+        >
+          Layer {layer}
+        </button>
+      {/each}
+    </div>
+    <!-- Select how many colors participate in the Fade sequence -->
+    <div class="mt-6">
+      <p class="text-sm font-medium text-slate-300">
+        Number of Colors
+      </p>
+
+      <div class="mt-3 flex gap-6">
+        <label class="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+          <input
+            type="radio"
+            name="fade-color-count"
+            value="2"
+            checked={fadeConfigs[activeFadeLayer].colorCount === 2}
+            onchange={() => fadeConfigs[activeFadeLayer].colorCount = 2}
+            class="accent-blue-600"
+          />
+          2 Colors
+        </label>
+
+        <label class="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+          <input
+            type="radio"
+            name="fade-color-count"
+            value="3"
+            checked={fadeConfigs[activeFadeLayer].colorCount === 3}
+            onchange={() => fadeConfigs[activeFadeLayer].colorCount = 3}
+            class="accent-blue-600"
+          />
+          3 Colors
+        </label>
+      </div>
+      <!-- Configure the selected layer's Fade colors -->
+      <div class="mt-6 grid grid-cols-3 gap-3">
+        {#each fadeConfigs[activeFadeLayer].colors.slice(0, fadeConfigs[activeFadeLayer].colorCount) as color, index}
+          <div>
+            <label
+              for={`fade-color-${index}`}
+              class="mb-2 block text-center text-sm font-medium text-slate-300"
+            >
+              Color {index + 1}
+            </label>
+
+            <input
+              id={`fade-color-${index}`}
+              type="color"
+              value={color}
+              oninput={(event) => {
+                fadeConfigs[activeFadeLayer].colors[index] = event.currentTarget.value;
+                fadeConfigs = [...fadeConfigs];
+              }}
+              class="h-16 w-full cursor-pointer rounded-lg border border-slate-700 bg-transparent"
+            />
+          </div>
+        {/each}
+      </div>
+    </div>
+
+    <!-- Brightness percentage for the selected Fade layer -->
+    <div class="mt-6">
+      <label for="fade-brightness" class="block text-sm font-medium text-slate-300">
+        Brightness: {fadeConfigs[activeFadeLayer].brightness}%
+      </label>
+
+      <input
+        id="fade-brightness"
+        type="range"
+        min="0"
+        max="100"
+        step="1"
+        value={fadeConfigs[activeFadeLayer].brightness}
+        oninput={(event) => {
+          fadeConfigs[activeFadeLayer].brightness = Number(event.currentTarget.value);
+          fadeConfigs = [...fadeConfigs];
+        }}
+        class="mt-3 w-full cursor-pointer accent-blue-600"
+      />
+    </div>
+
+    <!-- Number of interpolation steps between consecutive Fade colors -->
+    <div class="mt-6">
+      <label for="fade-steps" class="block text-sm font-medium text-slate-300">
+        Fade Transition: {fadeConfigs[activeFadeLayer].transitionSteps} steps
+      </label>
+
+      <p class="mt-1 text-xs text-slate-400">
+        Higher values produce slower transitions. The default is 200 steps;
+        actual duration depends on the LED controller's update rate.
+      </p>
+
+      <input
+        id="fade-steps"
+        type="range"
+        min="100"
+        max="500"
+        step="50"
+        value={fadeConfigs[activeFadeLayer].transitionSteps}
+        oninput={(event) => {
+          fadeConfigs[activeFadeLayer].transitionSteps = Number(event.currentTarget.value);
+          fadeConfigs = [...fadeConfigs];
+        }}
+        class="mt-3 w-full cursor-pointer accent-blue-600"
+      />
+    </div>
+
+    <!-- Save the selected Fade layer's configuration -->
+    <button
+      type="button"
+      onclick={saveFadeLayer}
+      disabled={!effectsConnected ||
+                !isEffectsOwner ||
+                fadeSavePending}
+      class="mt-8 w-full rounded-lg bg-green-600 px-6 py-3 font-semibold text-white hover:bg-green-500 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      Save Layer {activeFadeLayer}
+    </button>
+
+    <!-- Display the ESP32's Fade configuration save result -->
+    {#if fadeSaveStatus}
+      <p class="mt-3 text-center text-sm text-slate-300">
+        {fadeSaveStatus}
+      </p>
     {/if}
+
+    <!-- Activate or deactivate Fade through the LED controller -->
+    <button
+      type="button"
+      onclick={toggleFade}
+      disabled={!effectsConnected ||
+                !isEffectsOwner ||
+                activeLedMode === 'unknown' ||
+                effectsTransitioning}
+      class="mt-8 w-full rounded-lg bg-blue-600 px-6 py-3 font-semibold text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      {activeLedMode === 'fade' ? 'Deactivate Fade' : 'Activate Fade'}
+    </button>
+  {/if}
   </div>
   </div>
 </main>
