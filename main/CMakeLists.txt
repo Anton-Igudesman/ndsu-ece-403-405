@@ -9,6 +9,7 @@ idf_component_register(
       "led/effects/led_effects.c"
       "led/effects/led_color_fade.c"
       "led/effects/led_effect_transition.c"
+      "led/effects/led_effect_text.c"
       "led/led_cube_mapper.c"
       "led/led_cube_renderer.c"
       "led/led_controller.c"
@@ -26,6 +27,8 @@ idf_component_register(
       "web/backend/client_manager.c"
       "web/backend/web_terminal.c"
       "web/backend/terminal_session_manager.c"
+      "led/text/led_font3x5.c"
+      "led/text/led_text.c"
    INCLUDE_DIRS 
       "."
       "app"
