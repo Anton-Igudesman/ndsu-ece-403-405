@@ -1,13 +1,13 @@
 <script>
   import { onMount } from 'svelte';
 
-  /** @typedef {'Blink' | 'Fade' | 'Breathe' | 'Pockets'} EffectTab */
+  /** @typedef {'Blink' | 'Fade' | 'Breathe' | 'Pockets' | 'Text'} EffectTab */
 
   /** @type {EffectTab} */
   let activeTab = 'Blink';
 
   /** @type {EffectTab[]} */
-  const effects = ['Blink', 'Fade', 'Breathe', 'Pockets'];
+  const effects = ['Blink', 'Fade', 'Breathe', 'Pockets', 'Text'];
 
   // Effects Dashboard WebSocket connection and ownership state
   /** @type {WebSocket | null} */
@@ -46,6 +46,31 @@
   // Track which Blink layers have loaded their configurations from the ESP32
   /** @type {boolean[]} */
   let blinkLayersLoaded = Array(8).fill(false);
+
+  /**
+   * @typedef {'standard' | 'weave' | 'moving_face'} TextAnimationStyle
+   */
+
+  /** @type {TextAnimationStyle} */
+  let textAnimationStyle = 'standard';
+
+  // Current text configuration loaded from ESP32
+  let textMessage = '';
+  let textDefaultColor = '#000065';
+  let textCharacterColors = Array(12).fill('#000065');
+  let textScrollInterval = 150;
+
+  // Track firmware configuration and command acknowledgments
+  let textConfigLoaded = false;
+  let textSavePending = false;
+  let textModePending = false;
+  let textStatus = '';
+
+  // Future animation settings (not yet supported by firmware)
+  let textDepthEnabled = false;
+  let textDepthSpeed = 150;
+  let textDepthMin = 0;
+  let textDepthMax = 7;
 
   // Connect to the ESP32's existing terminal WebSocket
   function connectEffectsSocket() {
@@ -98,6 +123,10 @@
           layer
         }));
       }
+
+      // Retrieve saved scrolling text configuration
+      textConfigLoaded = false;
+      effectsSocket?.send(JSON.stringify({ action: 'text_get_config' }));
     };
 
     // Process controller mode and ownership updates
@@ -184,6 +213,42 @@
           effectsSocket?.send(JSON.stringify({ action: 'get_mode' }));
         }
 
+        // Process Text activation and deactivation acknowledgments
+        if (message.event === 'text_activation_result' ||
+            message.event === 'text_deactivation_result') {
+          textModePending = false;
+
+          if (message.success !== true) {
+            textStatus = `Text mode change failed: ${message.error ?? 'Unknown error'}`;
+          } else {
+            textStatus = '';
+          }
+
+          // Refresh the controller's actual operating mode
+          effectsSocket?.send(JSON.stringify({ action: 'get_mode' }));
+        }
+
+        // Handle scrolling text configuration command results
+        if ([
+          'text_message_result',
+          'text_default_color_result',
+          'text_character_color_result',
+          'text_reset_colors_result',
+          'text_scroll_interval_result',
+          'text_reset_config_result'
+        ].includes(message.event)) {
+          textSavePending = false;
+
+          if (message.success !== true) {
+            textStatus = `Text update failed: ${message.error ?? 'Unknown error'}`;
+          } else {
+            textStatus = 'Text settings updated successfully';
+
+            // Read back the configuration confirmed by the ESP32
+            effectsSocket?.send(JSON.stringify({ action: 'text_get_config' }));
+          }
+        }
+
         // Load saved Fade configurations returned by the ESP32
         if (message.event === 'fade_layer_config' && message.success === true) {
           const layer = message.layer;
@@ -232,6 +297,15 @@
             }
           }
         }
+
+        // Load scrolling text settings returned by the ESP32
+        if (message.event === 'text_config' && message.success === true) {
+          textMessage = message.message;
+          textDefaultColor = rgbToHex(message.default_color);
+          textCharacterColors = message.character_colors.map(rgbToHex);
+          textScrollInterval = message.interval_ms;
+          textConfigLoaded = true;
+        }
       } catch (error) {
         console.error('Invalid Effects WebSocket message:', error);
       }
@@ -255,6 +329,12 @@
       fadePendingLayer = null;
       fadeSaveStatus = '';
       effectsControlStatus = '';
+
+      // Discard pending Text operations and require fresh configuration
+      textConfigLoaded = false;
+      textSavePending = false;
+      textModePending = false;
+      textStatus = '';
     };
   }
 
@@ -483,6 +563,75 @@
     effectsSocket.send(JSON.stringify({ action }));
   }
 
+  /**
+   * Send one Text configuration command to the ESP32.
+   * @param {string} action
+   * @param {Record<string, unknown>} [params]
+   */
+  function sendTextCommand(action, params = {}) {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN) return;
+    if (!isEffectsOwner || !textConfigLoaded || textSavePending) return;
+
+    textSavePending = true;
+    textStatus = '';
+
+    effectsSocket.send(JSON.stringify({ action, ...params }));
+  }
+
+  // Save the scrolling message
+  function saveTextMessage() {
+    sendTextCommand('text_set_message', { message: textMessage });
+  }
+
+  // Save the default RGB color
+  function saveTextDefaultColor() {
+    sendTextCommand('text_set_default_color', {
+      color: hexToRgb(textDefaultColor)
+    });
+  }
+
+  // Save one character's RGB color
+  /** @param {number} index */
+  function saveTextCharacterColor(index) {
+    sendTextCommand('text_set_character_color', {
+      index,
+      color: hexToRgb(textCharacterColors[index])
+    });
+  }
+
+  // Save the scrolling interval
+  function saveTextScrollInterval() {
+    sendTextCommand('text_set_scroll_interval', {
+      interval_ms: textScrollInterval
+    });
+  }
+
+  // Restore character colors to their defaults
+  function resetTextColors() {
+    sendTextCommand('text_reset_colors');
+  }
+
+  // Restore the complete text configuration
+  function resetTextConfig() {
+    sendTextCommand('text_reset_config');
+  }
+
+  // Activate or deactivate Text through the existing LED controller
+  function toggleText() {
+    if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN) return;
+    if (!isEffectsOwner || !textConfigLoaded ||
+        effectsTransitioning || textModePending) return;
+
+    const action = activeLedMode === 'text'
+      ? 'text_deactivate'
+      : 'text_activate';
+
+    textModePending = true;
+    textStatus = '';
+
+    effectsSocket.send(JSON.stringify({ action }));
+  }
+
   // Request or release LED control through the existing Terminal WebSocket
   function toggleEffectsControl() {
     if (!effectsSocket || effectsSocket.readyState !== WebSocket.OPEN)
@@ -562,7 +711,7 @@
         {effectsControlStatus}
       </p>
     {/if}
-    <div class="mt-10 grid grid-cols-4 gap-2">
+    <div class="mt-10 grid grid-cols-5 gap-2">
       {#each effects as effect}
           <button
             type="button"
@@ -895,6 +1044,192 @@
     >
       {activeLedMode === 'fade' ? 'Deactivate Fade' : 'Activate Fade'}
     </button>
+
+  {:else if activeTab === 'Text'}
+    <!-- Configure the scrolling message -->
+    <div class="mt-6">
+      <label for="text-message" class="block text-sm font-medium text-slate-300">
+        Message ({textMessage.length}/12)
+      </label>
+
+      <input
+        id="text-message"
+        type="text"
+        maxlength="12"
+        bind:value={textMessage}
+        disabled={!textConfigLoaded || !isEffectsOwner}
+        class="mt-3 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-3 text-white"
+      />
+
+      <button
+        type="button"
+        onclick={saveTextMessage}
+        disabled={!effectsConnected || !isEffectsOwner || !textConfigLoaded ||
+                  textSavePending || textMessage.length === 0}
+        class="mt-3 w-full rounded-lg bg-green-600 px-6 py-3 font-semibold text-white disabled:opacity-50"
+      >
+        Save Message
+      </button>
+    </div>
+
+      <!-- Configure the default color for scrolling text -->
+      <div class="mt-6">
+        <label for="text-default-color" class="block text-sm font-medium text-slate-300">
+          Default Text Color
+        </label>
+
+        <input
+          id="text-default-color"
+          type="color"
+          bind:value={textDefaultColor}
+          disabled={!textConfigLoaded || !isEffectsOwner}
+          class="mt-3 h-14 w-full cursor-pointer rounded-lg border border-slate-700 bg-transparent"
+        />
+
+        <button
+          type="button"
+          onclick={saveTextDefaultColor}
+          disabled={!effectsConnected || !isEffectsOwner ||
+                    !textConfigLoaded || textSavePending}
+          class="mt-3 w-full rounded-lg bg-green-600 px-6 py-3 font-semibold text-white disabled:opacity-50"
+        >
+          Save Default Color
+        </button>
+      </div>
+
+      <!-- Configure an individual RGB color for each message character -->
+      <div class="mt-6">
+        <h3 class="text-sm font-medium text-slate-300">
+          Character Colors
+        </h3>
+
+        <div class="mt-3 grid grid-cols-3 gap-3">
+          {#each [...textMessage] as character, index}
+            <div>
+              <label
+                for={`text-character-${index}`}
+                class="mb-2 block text-center text-sm text-slate-300"
+              >
+                {character === ' ' ? 'Space' : character} ({index + 1})
+              </label>
+
+              <input
+                id={`text-character-${index}`}
+                type="color"
+                value={textCharacterColors[index] ?? textDefaultColor}
+                disabled={!textConfigLoaded || !isEffectsOwner || textSavePending}
+                oninput={(event) => {
+                  textCharacterColors[index] = event.currentTarget.value;
+                  textCharacterColors = [...textCharacterColors];
+                }}
+                class="h-12 w-full cursor-pointer rounded-lg border border-slate-700 bg-transparent"
+              />
+
+              <button
+                type="button"
+                onclick={() => saveTextCharacterColor(index)}
+                disabled={!effectsConnected || !isEffectsOwner ||
+                          !textConfigLoaded || textSavePending}
+                class="mt-2 w-full rounded-lg bg-green-600 px-2 py-2 text-xs font-semibold text-white disabled:opacity-50"
+              >
+                Save
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+
+      <!-- Configure how quickly text advances by one column -->
+      <div class="mt-6">
+        <label for="text-scroll-interval" class="block text-sm font-medium text-slate-300">
+          Scroll Interval: {textScrollInterval} ms
+        </label>
+
+        <input
+          id="text-scroll-interval"
+          type="range"
+          min="50"
+          max="2000"
+          step="50"
+          bind:value={textScrollInterval}
+          disabled={!textConfigLoaded || !isEffectsOwner}
+          class="mt-3 w-full cursor-pointer accent-blue-600"
+        />
+
+        <button
+          type="button"
+          onclick={saveTextScrollInterval}
+          disabled={!effectsConnected || !isEffectsOwner ||
+                    !textConfigLoaded || textSavePending}
+          class="mt-3 w-full rounded-lg bg-green-600 px-6 py-3 font-semibold text-white disabled:opacity-50"
+        >
+          Save Scroll Speed
+        </button>
+      </div>
+
+      <!-- Select the scrolling animation behavior -->
+      <div class="mt-6">
+        <label for="text-animation-style" class="block text-sm font-medium text-slate-300">
+          Animation Style
+        </label>
+
+        <select
+          id="text-animation-style"
+          bind:value={textAnimationStyle}
+          disabled={!textConfigLoaded || !isEffectsOwner}
+          class="mt-3 w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-3 text-white"
+        >
+          <option value="standard">Standard Scrolling</option>
+          <option value="weave" disabled>Vertical Weaving (Coming Soon)</option>
+          <option value="moving_face" disabled>Moving Face (Coming Soon)</option>
+        </select>
+
+        <p class="mt-2 text-xs text-slate-400">
+          Additional animation styles will become available when firmware support is implemented.
+        </p>
+      </div>
+
+      <!-- Restore individual character colors -->
+      <button
+        type="button"
+        onclick={resetTextColors}
+        disabled={!effectsConnected || !isEffectsOwner ||
+                  !textConfigLoaded || textSavePending}
+        class="mt-6 w-full rounded-lg bg-slate-700 px-6 py-3 font-semibold text-white hover:bg-slate-600 disabled:opacity-50"
+      >
+        Reset Character Colors
+      </button>
+
+      <!-- Restore the message, colors, and scrolling interval -->
+      <button
+        type="button"
+        onclick={resetTextConfig}
+        disabled={!effectsConnected || !isEffectsOwner ||
+                  !textConfigLoaded || textSavePending}
+        class="mt-3 w-full rounded-lg bg-slate-700 px-6 py-3 font-semibold text-white hover:bg-slate-600 disabled:opacity-50"
+      >
+        Reset Text Configuration
+      </button>
+
+      <!-- Display firmware command results -->
+      {#if textStatus}
+        <p class="mt-3 text-center text-sm text-slate-300">
+          {textStatus}
+        </p>
+      {/if}
+
+      <!-- Activate or deactivate scrolling text -->
+      <button
+        type="button"
+        onclick={toggleText}
+        disabled={!effectsConnected || !isEffectsOwner ||
+                  !textConfigLoaded || activeLedMode === 'unknown' ||
+                  effectsTransitioning || textModePending}
+        class="mt-8 w-full rounded-lg bg-blue-600 px-6 py-3 font-semibold text-white hover:bg-blue-500 disabled:opacity-50"
+      >
+        {activeLedMode === 'text' ? 'Deactivate Text' : 'Activate Text'}
+      </button>
+
   {/if}
   </div>
   </div>

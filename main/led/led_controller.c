@@ -3,6 +3,8 @@
 #include "effects/led_effects.h"
 #include "effects/led_effect_pockets.h"
 #include "effects/led_effect_transition.h"
+#include "effects/led_effect_text.h"
+#include "text/led_text.h"
 
 #include <stdbool.h>
 
@@ -29,6 +31,13 @@ esp_err_t led_controller_init(led_mode_t initial_mode)
    status = led_effects_fade_init();
    if (status != ESP_OK) return status;
 
+   // Load default message, colors, and scrolling interval
+   status = led_text_init();
+   if (status != ESP_OK) return status;
+
+   status = led_effect_text_init(false); // true argument acts as text_start()
+   if (status != ESP_OK) return status;
+
    status = led_controller_set_mode(initial_mode);
    if (status != ESP_OK) return status;
    s_initialized = true;
@@ -48,6 +57,7 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
       case LED_MODE_POCKETS:
       case LED_MODE_OFF:
       case LED_MODE_COMMAND:
+      case LED_MODE_TEXT:
          break;
 
       default:
@@ -72,6 +82,12 @@ esp_err_t led_controller_set_mode(led_mode_t mode)
       if (mode == LED_MODE_POCKETS)
       {
          esp_err_t status = led_effect_pockets_init();
+         if (status != ESP_OK) return status;
+      }
+
+      if (mode == LED_MODE_TEXT)
+      {
+         esp_err_t status = led_effect_text_init(true);
          if (status != ESP_OK) return status;
       }
 
@@ -141,6 +157,13 @@ esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
          if (status != ESP_OK) return status;
       }
 
+      // Restart text scrolling after mode transition completes
+      if (s_pending_mode == LED_MODE_TEXT)
+      {
+         status = led_effect_text_init(true);
+         if (status != ESP_OK) return status;
+      }
+
       // Promote the pending mode to the active mode
       s_active_mode = s_pending_mode;
       s_pending_mode = LED_MODE_OFF;
@@ -181,6 +204,9 @@ esp_err_t led_controller_dispatch_active_mode(const float *bands_norm)
       case LED_MODE_COMMAND:
          // Terminal commands control the framebuffer in this mode
          return ESP_OK;
+
+      case LED_MODE_TEXT:
+         return led_effect_text_step();
 
       default:
          return ESP_ERR_INVALID_STATE;

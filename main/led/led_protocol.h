@@ -13,7 +13,8 @@ typedef enum
    LED_MODE_AUDIO_EQ,
    LED_MODE_POCKETS,
    LED_MODE_OFF,
-   LED_MODE_COMMAND
+   LED_MODE_COMMAND,
+   LED_MODE_TEXT
 } led_mode_t;
 
 // Definition for mode a blink commands

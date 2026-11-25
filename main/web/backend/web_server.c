@@ -4,6 +4,7 @@
 #include "terminal_session_manager.h"
 #include "led_controller.h"
 #include "effects/led_effects.h"
+#include "text/led_text.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -439,6 +440,7 @@ static esp_err_t handle_terminal_get_mode(
       case LED_MODE_POCKETS:  mode_name = "pockets";  break;
       case LED_MODE_OFF:      mode_name = "off";      break;
       case LED_MODE_COMMAND:  mode_name = "command";  break;
+      case LED_MODE_TEXT:     mode_name = "text";     break;
       default: return ESP_ERR_INVALID_STATE;
    }
 
@@ -957,6 +959,206 @@ static esp_err_t handle_fade_deactivate(
    return led_controller_set_mode(LED_MODE_OFF);
 }
 
+// Activate scrolling text using the saved configuration
+static esp_err_t handle_text_activate(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   return led_controller_set_mode(LED_MODE_TEXT);
+}
+
+// Update the scrolling text message
+static esp_err_t handle_text_set_message(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   const cJSON *message = cJSON_GetObjectItemCaseSensitive(root, "message");
+   if (! cJSON_IsString(message)) return ESP_ERR_INVALID_ARG;
+
+   return led_text_set_message(message->valuestring);
+}
+
+// Update default scrolling text color
+static esp_err_t handle_text_set_default_color(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   led_cube_color_t color;
+   esp_err_t status = get_web_rgb_color(root, "color", &color);
+   if (status != ESP_OK) return status;
+
+   return led_text_set_default_color(color);
+}
+
+// Update RGB color of one character by index
+static esp_err_t handle_text_set_character_color(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   uint32_t index;
+   led_cube_color_t color;
+
+   if (get_web_uint_param(root, "index", LED_TEXT_MAX_LENGTH - 1U, &index) != ESP_OK) return ESP_ERR_INVALID_ARG;
+
+   esp_err_t status = get_web_rgb_color(root, "color", &color);
+   if (status != ESP_OK) return status;
+
+   return led_text_set_character_color((size_t)index, color);
+}
+
+// Reset all character colors to factory default
+static esp_err_t handle_text_reset_colors(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   return led_text_reset_colors();
+}
+
+// Update scrolling interval
+static esp_err_t handle_text_set_scroll_interval(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   uint32_t interval_ms;
+
+   if (get_web_uint_param(root, "interval_ms", 2000U, &interval_ms) != ESP_OK) return ESP_ERR_INVALID_ARG;
+
+   return led_text_set_scroll_interval((uint16_t)interval_ms);
+}
+
+// Restore all scrolling text setting to factor defaults
+static esp_err_t handle_text_reset_config(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   return led_text_init();
+}
+
+// Return the current scrolling text configuration
+static esp_err_t handle_text_get_config(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   led_text_config_t config;
+
+   esp_err_t status = led_text_get_config(&config);
+   if (status != ESP_OK) return status;
+
+   cJSON *response = cJSON_CreateObject();
+   if (response == NULL) return ESP_ERR_NO_MEM;
+
+   cJSON_AddStringToObject(response, "event", "text_config");
+   cJSON_AddBoolToObject(response, "success", true);
+   cJSON_AddStringToObject(response, "message", config.message);
+   cJSON_AddNumberToObject(response, "interval_ms", config.scroll_interval_ms);
+
+   cJSON *default_color = cJSON_AddObjectToObject(response, "default_color");
+   cJSON *character_colors = cJSON_AddArrayToObject(response, "character_colors");
+
+   if (default_color == NULL || character_colors == NULL)
+   {
+      cJSON_Delete(response);
+      return ESP_ERR_NO_MEM;
+   }
+
+   cJSON_AddNumberToObject(default_color, "r", config.default_color.red);
+   cJSON_AddNumberToObject(default_color, "g", config.default_color.green);
+   cJSON_AddNumberToObject(default_color, "b", config.default_color.blue);
+
+   for (size_t i = 0; config.message[i] != '\0' && i < LED_TEXT_MAX_LENGTH; i++)
+   {
+      cJSON *color = cJSON_CreateObject();
+      if (color == NULL)
+      {
+         cJSON_Delete(response);
+         return ESP_ERR_NO_MEM;
+      }
+
+      if (!cJSON_AddItemToArray(character_colors, color))
+      {
+         cJSON_Delete(color);
+         cJSON_Delete(response);
+         return ESP_ERR_NO_MEM;
+      }
+
+      cJSON_AddNumberToObject(color, "r", config.character_colors[i].red);
+      cJSON_AddNumberToObject(color, "g", config.character_colors[i].green);
+      cJSON_AddNumberToObject(color, "b", config.character_colors[i].blue);
+   }
+
+   status = send_websocket_json(
+      httpd_req_to_sockfd(request),
+      response
+   );
+
+   cJSON_Delete(response);
+
+   return status;
+}
+
+// Deactivate scrolling text through existing LED controller
+static esp_err_t handle_text_deactivate(
+   httpd_req_t *request,
+   const cJSON *root
+)
+{
+   if (request == NULL || root == NULL) return ESP_ERR_INVALID_ARG;
+
+   int socket_fd = httpd_req_to_sockfd(request);
+   if (!terminal_session_manager_is_owner(socket_fd)) return ESP_ERR_INVALID_STATE;
+
+   // Only deactivate when text is active and no transition is underway
+   if (led_controller_is_transitioning() ||
+      led_controller_get_mode() != LED_MODE_TEXT) return ESP_ERR_INVALID_STATE;
+
+   return led_controller_set_mode(LED_MODE_OFF);
+}
+
 // Change the LED operating mode for the current terminal owner
 static esp_err_t handle_terminal_set_mode(
    httpd_req_t *request,
@@ -1067,6 +1269,15 @@ static const terminal_action_entry_t s_terminal_actions[] =
    {"fade_get_layer", "fade_layer_config", handle_fade_get_layer, false, false},
    {"fade_activate", "fade_activation_result", handle_fade_activate, false, false},
    {"fade_deactivate", "fade_deactivation_result", handle_fade_deactivate, false, false},
+   {"text_activate", "text_activation_result", handle_text_activate, false, false},
+   {"text_deactivate", "text_deactivation_result", handle_text_deactivate, false, false},
+   {"text_set_message", "text_message_result", handle_text_set_message, false, false},
+   {"text_set_character_color", "text_character_color_result", handle_text_set_character_color, false, false},
+   {"text_reset_colors", "text_reset_colors_result", handle_text_reset_colors, false, false},
+   {"text_set_scroll_interval", "text_scroll_interval_result", handle_text_set_scroll_interval, false, false},
+   {"text_set_default_color", "text_default_color_result", handle_text_set_default_color, false, false},
+   {"text_reset_config", "text_reset_config_result", handle_text_reset_config, false, false},
+   {"text_get_config", "text_config", handle_text_get_config, false, false}
 };
 
 // Resolve and execute a terminal action using the registered handlers
@@ -2232,6 +2443,7 @@ static esp_err_t terminal_websocket_handler(httpd_req_t *request)
       strcmp(event, "blink_layer_config") == 0 ||
       strcmp(event, "blink_save_result") == 0 ||
       strcmp(event, "fade_layer_config") == 0 ||
+      strcmp(event, "text_config") == 0 ||
       strcmp(event, "fade_save_result") == 0)) return status;
 
    return send_websocket_response(
